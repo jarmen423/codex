@@ -1415,6 +1415,7 @@ dependencies = [
  "codex-app-server-protocol",
  "codex-git-utils",
  "codex-login",
+ "codex-model-provider",
  "codex-plugin",
  "codex-protocol",
  "codex-utils-absolute-path",
@@ -1447,6 +1448,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
+ "codex-auth-provider",
  "codex-client",
  "codex-protocol",
  "codex-utils-rustls-provider",
@@ -1498,6 +1500,7 @@ dependencies = [
  "codex-git-utils",
  "codex-login",
  "codex-mcp",
+ "codex-model-provider",
  "codex-model-provider-info",
  "codex-models-manager",
  "codex-otel",
@@ -1667,13 +1670,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-auth-provider"
+version = "0.0.0"
+dependencies = [
+ "http 1.4.0",
+]
+
+[[package]]
 name = "codex-backend-client"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "codex-auth-provider",
  "codex-backend-openapi-models",
  "codex-client",
  "codex-login",
+ "codex-model-provider",
  "codex-protocol",
  "pretty_assertions",
  "reqwest",
@@ -1697,11 +1709,11 @@ dependencies = [
  "anyhow",
  "clap",
  "codex-app-server-protocol",
- "codex-config",
  "codex-connectors",
  "codex-core",
  "codex-git-utils",
  "codex-login",
+ "codex-model-provider",
  "codex-utils-cargo-bin",
  "codex-utils-cli",
  "pretty_assertions",
@@ -1828,7 +1840,6 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
  "chrono",
  "clap",
  "codex-client",
@@ -1837,6 +1848,7 @@ dependencies = [
  "codex-core",
  "codex-git-utils",
  "codex-login",
+ "codex-model-provider",
  "codex-tui",
  "codex-utils-cli",
  "crossterm",
@@ -1861,6 +1873,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "codex-auth-provider",
  "codex-backend-client",
  "codex-git-utils",
  "serde",
@@ -2079,6 +2092,7 @@ dependencies = [
  "codex-exec-server",
  "codex-git-utils",
  "codex-login",
+ "codex-model-provider",
  "codex-plugin",
  "codex-protocol",
  "codex-utils-absolute-path",
@@ -2106,6 +2120,7 @@ dependencies = [
  "codex-config",
  "codex-exec-server",
  "codex-login",
+ "codex-model-provider",
  "codex-otel",
  "codex-protocol",
  "codex-skills",
@@ -2464,6 +2479,7 @@ dependencies = [
  "codex-config",
  "codex-exec-server",
  "codex-login",
+ "codex-model-provider",
  "codex-otel",
  "codex-plugin",
  "codex-protocol",
@@ -2523,6 +2539,7 @@ name = "codex-model-provider"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "codex-agent-identity",
  "codex-api",
  "codex-login",
  "codex-model-provider-info",

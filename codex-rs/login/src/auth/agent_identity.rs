@@ -13,7 +13,7 @@ const DEFAULT_CHATGPT_BACKEND_BASE_URL: &str = "https://chatgpt.com/backend-api"
 #[derive(Debug)]
 pub struct AgentIdentityAuth {
     record: AgentIdentityAuthRecord,
-    process_task_id: Arc<OnceCell<String>>,
+    pub(super) process_task_id: Arc<OnceCell<String>>,
 }
 
 impl Clone for AgentIdentityAuth {
@@ -35,6 +35,10 @@ impl AgentIdentityAuth {
 
     pub fn record(&self) -> &AgentIdentityAuthRecord {
         &self.record
+    }
+
+    pub fn process_task_id(&self) -> Option<&str> {
+        self.process_task_id.get().map(String::as_str)
     }
 
     pub async fn ensure_runtime(&self, chatgpt_base_url: Option<String>) -> std::io::Result<()> {
