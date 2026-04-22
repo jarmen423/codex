@@ -43,6 +43,20 @@ fn assistant_msg(text: &str) -> ResponseItem {
     }
 }
 
+fn disabled_environment_manager_for_tests() -> Arc<codex_exec_server::EnvironmentManager> {
+    let runtime_paths = codex_exec_server::ExecServerRuntimePaths::new(
+        std::env::current_exe().expect("current exe path"),
+        /*codex_linux_sandbox_exe*/ None,
+    )
+    .expect("runtime paths");
+    Arc::new(codex_exec_server::EnvironmentManager::new(
+        codex_exec_server::EnvironmentManagerArgs {
+            exec_server_url: Some("none".to_string()),
+            local_runtime_paths: runtime_paths,
+        },
+    ))
+}
+
 #[test]
 fn truncates_before_requested_user_message() {
     let items = [
@@ -268,6 +282,45 @@ async fn shutdown_all_threads_bounded_submits_shutdown_to_every_thread() {
     assert_eq!(report.completed, expected_completed);
     assert!(report.submit_failed.is_empty());
     assert!(report.timed_out.is_empty());
+    assert!(manager.list_thread_ids().await.is_empty());
+}
+
+#[tokio::test]
+async fn start_thread_rejects_sticky_environment_when_environment_access_is_disabled() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        disabled_environment_manager_for_tests(),
+    );
+
+    let err = match manager
+        .start_thread_with_tools_and_service_name(StartThreadWithToolsOptions {
+            config: config.clone(),
+            initial_history: InitialHistory::New,
+            dynamic_tools: Vec::new(),
+            persist_extended_history: false,
+            metrics_service_name: None,
+            parent_trace: None,
+            environments: Some(vec![TurnEnvironmentSelection {
+                environment_id: "local".to_string(),
+                cwd: config.cwd.clone(),
+            }]),
+        })
+        .await
+    {
+        Ok(_) => panic!("sticky environment should fail when environment access is disabled"),
+        Err(err) => err,
+    };
+
+    assert!(matches!(err, CodexErr::InvalidRequest(_)));
+    assert_eq!(err.to_string(), "environment access is disabled");
     assert!(manager.list_thread_ids().await.is_empty());
 }
 
