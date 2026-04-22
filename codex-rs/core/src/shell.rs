@@ -1,5 +1,9 @@
 use crate::shell_detect::detect_shell_type;
 use crate::shell_snapshot::ShellSnapshot;
+#[cfg(windows)]
+use codex_shell_command::powershell::try_find_powershell_executable_blocking;
+#[cfg(windows)]
+use codex_shell_command::powershell::try_find_pwsh_executable_blocking;
 use serde::Deserialize;
 use serde::Serialize;
 use std::path::PathBuf;
@@ -250,21 +254,44 @@ const POWERSHELL_FALLBACK_PATHS: &[&str] =
 const POWERSHELL_FALLBACK_PATHS: &[&str] = &[];
 
 fn get_powershell_shell(path: Option<&PathBuf>) -> Option<Shell> {
-    let shell_path = get_shell_path(ShellType::PowerShell, path, "pwsh", PWSH_FALLBACK_PATHS)
-        .or_else(|| {
-            get_shell_path(
-                ShellType::PowerShell,
-                path,
-                "powershell",
-                POWERSHELL_FALLBACK_PATHS,
-            )
-        });
+    // Respect an explicit shell path first. This preserves model/user overrides
+    // and avoids changing behavior when the caller already chose a specific
+    // executable.
+    let shell_path = if path.and_then(file_exists).is_some() {
+        path.cloned()
+    } else {
+        validated_powershell_shell_path().or_else(|| {
+            get_shell_path(ShellType::PowerShell, path, "pwsh", PWSH_FALLBACK_PATHS).or_else(|| {
+                get_shell_path(
+                    ShellType::PowerShell,
+                    path,
+                    "powershell",
+                    POWERSHELL_FALLBACK_PATHS,
+                )
+            })
+        })
+    };
 
     shell_path.map(|shell_path| Shell {
         shell_type: ShellType::PowerShell,
         shell_path,
         shell_snapshot: empty_shell_snapshot_receiver(),
     })
+}
+
+#[cfg(windows)]
+fn validated_powershell_shell_path() -> Option<PathBuf> {
+    // Windows PATH can surface unusable WindowsApps aliases for `pwsh.exe`.
+    // Prefer PowerShell-specific discovery that probes executability, then fall
+    // back to generic shell resolution only if both validated lookups fail.
+    try_find_pwsh_executable_blocking()
+        .map(|path| path.to_path_buf())
+        .or_else(|| try_find_powershell_executable_blocking().map(|path| path.to_path_buf()))
+}
+
+#[cfg(not(windows))]
+fn validated_powershell_shell_path() -> Option<PathBuf> {
+    None
 }
 
 fn get_cmd_shell(path: Option<&PathBuf>) -> Option<Shell> {
@@ -338,6 +365,10 @@ fn default_user_shell_from_path(user_shell_path: Option<PathBuf>) -> Shell {
 #[cfg(test)]
 mod detect_shell_type_tests {
     use super::*;
+    #[cfg(windows)]
+    use codex_shell_command::powershell::try_find_powershell_executable_blocking;
+    #[cfg(windows)]
+    use codex_shell_command::powershell::try_find_pwsh_executable_blocking;
 
     #[test]
     fn test_detect_shell_type() {
@@ -400,6 +431,19 @@ mod detect_shell_type_tests {
             detect_shell_type(&PathBuf::from("cmd.exe")),
             Some(ShellType::Cmd)
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn powershell_shell_prefers_validated_executable_discovery() {
+        let shell = get_shell(ShellType::PowerShell, /*path*/ None)
+            .expect("windows should resolve a powershell shell");
+        let expected = try_find_pwsh_executable_blocking()
+            .map(|path| path.to_path_buf())
+            .or_else(|| try_find_powershell_executable_blocking().map(|path| path.to_path_buf()))
+            .expect("windows test environment should have a powershell executable");
+
+        assert_eq!(shell.shell_path, expected);
     }
 }
 
