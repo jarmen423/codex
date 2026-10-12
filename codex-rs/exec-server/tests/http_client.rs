@@ -4,19 +4,23 @@ use std::time::Duration;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
-use codex_app_server_protocol::JSONRPCMessage;
-use codex_app_server_protocol::JSONRPCNotification;
-use codex_app_server_protocol::JSONRPCRequest;
-use codex_app_server_protocol::JSONRPCResponse;
-use codex_app_server_protocol::RequestId;
 use codex_exec_server::ExecServerClient;
 use codex_exec_server::HttpHeader;
+use codex_exec_server::HttpRedirectPolicy;
 use codex_exec_server::HttpRequestBodyDeltaNotification;
 use codex_exec_server::HttpRequestParams;
 use codex_exec_server::HttpRequestResponse;
 use codex_exec_server::InitializeParams;
 use codex_exec_server::InitializeResponse;
 use codex_exec_server::RemoteExecServerConnectArgs;
+use codex_exec_server_protocol::JSONRPCMessage;
+use codex_exec_server_protocol::JSONRPCNotification;
+use codex_exec_server_protocol::JSONRPCRequest;
+use codex_exec_server_protocol::JSONRPCResponse;
+use codex_exec_server_protocol::MAX_HTTP_BODY_DELTA_BYTES;
+use codex_exec_server_protocol::RequestId;
+use codex_http_client::HttpClientFactory;
+use codex_http_client::OutboundProxyPolicy;
 use futures::SinkExt;
 use futures::StreamExt;
 use pretty_assertions::assert_eq;
@@ -42,6 +46,9 @@ const HTTP_REQUEST_BODY_DELTA_METHOD: &str = "http/request/bodyDelta";
 const INITIALIZE_METHOD: &str = "initialize";
 const INITIALIZED_METHOD: &str = "initialized";
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+const BYTE_BUDGET_TEST_TIMEOUT: Duration = Duration::from_secs(30);
+const HTTP_BODY_DELTA_CHANNEL_CAPACITY: u64 = 256;
+const HTTP_BODY_DELTA_BYTE_BUDGET: usize = 16 * 1024 * 1024;
 const OVERFLOWING_BODY_DELTA_FRAMES: u64 = 1_024;
 
 /// What this tests: the buffered HTTP helper always sends a buffered
@@ -51,8 +58,8 @@ async fn http_request_forces_buffered_request_params() -> Result<()> {
     // Phase 1: start a fake WebSocket exec-server so the test covers the
     // public client connection path without depending on the HTTP runner.
     let server = spawn_scripted_exec_server(|mut peer| async move {
-        // Phase 2: verify the buffered helper strips streaming-only fields
-        // before it sends the JSON-RPC call.
+        // Phase 2: verify the buffered helper forces buffered mode before it
+        // sends the JSON-RPC call.
         let (request_id, params) = peer.read_http_request().await?;
         assert_eq!(
             params,
@@ -62,7 +69,8 @@ async fn http_request_forces_buffered_request_params() -> Result<()> {
                 headers: Vec::new(),
                 body: None,
                 timeout_ms: None,
-                request_id: None,
+                redirect_policy: HttpRedirectPolicy::Follow,
+                request_id: "ignored-stream-id".to_string(),
                 stream_response: false,
             }
         );
@@ -90,7 +98,8 @@ async fn http_request_forces_buffered_request_params() -> Result<()> {
             headers: Vec::new(),
             body: None,
             timeout_ms: None,
-            request_id: Some("ignored-stream-id".to_string()),
+            redirect_policy: HttpRedirectPolicy::Follow,
+            request_id: "ignored-stream-id".to_string(),
             stream_response: true,
         }),
     )
@@ -127,10 +136,12 @@ async fn http_response_body_stream_uses_generated_ids_and_receives_ordered_delta
                 headers: vec![HttpHeader {
                     name: "accept".to_string(),
                     value: "text/event-stream".to_string(),
+                    value_env_var: None,
                 }],
                 body: None,
                 timeout_ms: None,
-                request_id: Some("http-1".to_string()),
+                redirect_policy: HttpRedirectPolicy::Follow,
+                request_id: "http-1".to_string(),
                 stream_response: true,
             }
         );
@@ -144,6 +155,7 @@ async fn http_response_body_stream_uses_generated_ids_and_receives_ordered_delta
                 headers: vec![HttpHeader {
                     name: "content-type".to_string(),
                     value: "text/event-stream".to_string(),
+                    value_env_var: None,
                 }],
                 body: Vec::new().into(),
             },
@@ -185,7 +197,8 @@ async fn http_response_body_stream_uses_generated_ids_and_receives_ordered_delta
                 headers: Vec::new(),
                 body: None,
                 timeout_ms: None,
-                request_id: Some("http-2".to_string()),
+                redirect_policy: HttpRedirectPolicy::Follow,
+                request_id: "http-2".to_string(),
                 stream_response: true,
             }
         );
@@ -211,10 +224,12 @@ async fn http_response_body_stream_uses_generated_ids_and_receives_ordered_delta
             headers: vec![HttpHeader {
                 name: "accept".to_string(),
                 value: "text/event-stream".to_string(),
+                value_env_var: None,
             }],
             body: None,
             timeout_ms: None,
-            request_id: Some("caller-stream-id".to_string()),
+            redirect_policy: HttpRedirectPolicy::Follow,
+            request_id: "caller-stream-id".to_string(),
             stream_response: false,
         }),
     )
@@ -227,6 +242,7 @@ async fn http_response_body_stream_uses_generated_ids_and_receives_ordered_delta
             headers: vec![HttpHeader {
                 name: "content-type".to_string(),
                 value: "text/event-stream".to_string(),
+                value_env_var: None,
             }],
             body: Vec::new().into(),
         }
@@ -252,7 +268,8 @@ async fn http_response_body_stream_uses_generated_ids_and_receives_ordered_delta
             headers: Vec::new(),
             body: None,
             timeout_ms: None,
-            request_id: Some("caller-stream-id".to_string()),
+            redirect_policy: HttpRedirectPolicy::Follow,
+            request_id: "caller-stream-id".to_string(),
             stream_response: false,
         }),
     )
@@ -288,7 +305,8 @@ async fn http_response_body_stream_drops_queued_terminal_before_next_generated_i
                 headers: Vec::new(),
                 body: None,
                 timeout_ms: None,
-                request_id: Some("http-1".to_string()),
+                redirect_policy: HttpRedirectPolicy::Follow,
+                request_id: "http-1".to_string(),
                 stream_response: true,
             }
         );
@@ -321,7 +339,8 @@ async fn http_response_body_stream_drops_queued_terminal_before_next_generated_i
                 headers: Vec::new(),
                 body: None,
                 timeout_ms: None,
-                request_id: Some("http-2".to_string()),
+                redirect_policy: HttpRedirectPolicy::Follow,
+                request_id: "http-2".to_string(),
                 stream_response: true,
             }
         );
@@ -347,7 +366,8 @@ async fn http_response_body_stream_drops_queued_terminal_before_next_generated_i
             headers: Vec::new(),
             body: None,
             timeout_ms: None,
-            request_id: Some("caller-stream-id".to_string()),
+            redirect_policy: HttpRedirectPolicy::Follow,
+            request_id: "caller-stream-id".to_string(),
             stream_response: false,
         }),
     )
@@ -371,7 +391,8 @@ async fn http_response_body_stream_drops_queued_terminal_before_next_generated_i
         headers: Vec::new(),
         body: None,
         timeout_ms: None,
-        request_id: Some("caller-stream-id".to_string()),
+        redirect_policy: HttpRedirectPolicy::Follow,
+        request_id: "caller-stream-id".to_string(),
         stream_response: false,
     };
     let (reuse_response, _reuse_body_stream) =
@@ -410,7 +431,8 @@ async fn http_response_body_stream_ignores_late_deltas_after_cancelled_request()
                 headers: Vec::new(),
                 body: None,
                 timeout_ms: None,
-                request_id: Some("http-1".to_string()),
+                redirect_policy: HttpRedirectPolicy::Follow,
+                request_id: "http-1".to_string(),
                 stream_response: true,
             }
         );
@@ -429,7 +451,8 @@ async fn http_response_body_stream_ignores_late_deltas_after_cancelled_request()
                 headers: Vec::new(),
                 body: None,
                 timeout_ms: None,
-                request_id: Some("http-2".to_string()),
+                redirect_policy: HttpRedirectPolicy::Follow,
+                request_id: "http-2".to_string(),
                 stream_response: true,
             }
         );
@@ -473,7 +496,8 @@ async fn http_response_body_stream_ignores_late_deltas_after_cancelled_request()
                 headers: Vec::new(),
                 body: None,
                 timeout_ms: None,
-                request_id: Some("caller-stream-id".to_string()),
+                redirect_policy: HttpRedirectPolicy::Follow,
+                request_id: "caller-stream-id".to_string(),
                 stream_response: false,
             })
             .await;
@@ -494,7 +518,8 @@ async fn http_response_body_stream_ignores_late_deltas_after_cancelled_request()
             headers: Vec::new(),
             body: None,
             timeout_ms: None,
-            request_id: Some("caller-stream-id".to_string()),
+            redirect_policy: HttpRedirectPolicy::Follow,
+            request_id: "caller-stream-id".to_string(),
             stream_response: false,
         }),
     )
@@ -540,7 +565,8 @@ async fn http_response_body_stream_ignores_late_deltas_after_drop() -> Result<()
                 headers: Vec::new(),
                 body: None,
                 timeout_ms: None,
-                request_id: Some("http-1".to_string()),
+                redirect_policy: HttpRedirectPolicy::Follow,
+                request_id: "http-1".to_string(),
                 stream_response: true,
             }
         );
@@ -579,7 +605,8 @@ async fn http_response_body_stream_ignores_late_deltas_after_drop() -> Result<()
                 headers: Vec::new(),
                 body: None,
                 timeout_ms: None,
-                request_id: Some("http-2".to_string()),
+                redirect_policy: HttpRedirectPolicy::Follow,
+                request_id: "http-2".to_string(),
                 stream_response: true,
             }
         );
@@ -614,7 +641,8 @@ async fn http_response_body_stream_ignores_late_deltas_after_drop() -> Result<()
             headers: Vec::new(),
             body: None,
             timeout_ms: None,
-            request_id: Some("caller-stream-id".to_string()),
+            redirect_policy: HttpRedirectPolicy::Follow,
+            request_id: "caller-stream-id".to_string(),
             stream_response: false,
         }),
     )
@@ -646,7 +674,8 @@ async fn http_response_body_stream_ignores_late_deltas_after_drop() -> Result<()
             headers: Vec::new(),
             body: None,
             timeout_ms: None,
-            request_id: Some("caller-stream-id".to_string()),
+            redirect_policy: HttpRedirectPolicy::Follow,
+            request_id: "caller-stream-id".to_string(),
             stream_response: false,
         }),
     )
@@ -690,7 +719,8 @@ async fn http_response_body_stream_fails_when_transport_disconnects() -> Result<
                 headers: Vec::new(),
                 body: None,
                 timeout_ms: None,
-                request_id: Some("http-1".to_string()),
+                redirect_policy: HttpRedirectPolicy::Follow,
+                request_id: "http-1".to_string(),
                 stream_response: true,
             }
         );
@@ -716,7 +746,8 @@ async fn http_response_body_stream_fails_when_transport_disconnects() -> Result<
             headers: Vec::new(),
             body: None,
             timeout_ms: None,
-            request_id: Some("caller-stream-id".to_string()),
+            redirect_policy: HttpRedirectPolicy::Follow,
+            request_id: "caller-stream-id".to_string(),
             stream_response: false,
         }),
     )
@@ -742,6 +773,492 @@ async fn http_response_body_stream_fails_when_transport_disconnects() -> Result<
     Ok(())
 }
 
+/// What this tests: an executor cannot make the orchestrator decode and retain
+/// a body frame larger than the response-stream wire contract allows.
+#[tokio::test]
+async fn http_response_body_stream_rejects_oversized_delta() -> Result<()> {
+    let (finish_tx, finish_rx) = oneshot::channel();
+    let server = spawn_scripted_exec_server(|mut peer| async move {
+        let (_request_id, params) = peer.read_http_request().await?;
+        assert_eq!(
+            params,
+            HttpRequestParams {
+                method: "GET".to_string(),
+                url: "https://example.test/mcp/oversized-delta".to_string(),
+                headers: Vec::new(),
+                body: None,
+                timeout_ms: None,
+                redirect_policy: HttpRedirectPolicy::Follow,
+                request_id: "http-1".to_string(),
+                stream_response: true,
+            }
+        );
+        peer.write_body_delta(HttpRequestBodyDeltaNotification {
+            request_id: "http-1".to_string(),
+            seq: 1,
+            delta: vec![0; MAX_HTTP_BODY_DELTA_BYTES + 1].into(),
+            done: false,
+            error: None,
+        })
+        .await?;
+        finish_rx.await.expect("test should finish server task");
+        Ok(())
+    })
+    .await?;
+    let client = server.connect_client().await?;
+
+    let request = HttpRequestParams {
+        method: "GET".to_string(),
+        url: "https://example.test/mcp/oversized-delta".to_string(),
+        headers: Vec::new(),
+        body: None,
+        timeout_ms: None,
+        redirect_policy: HttpRedirectPolicy::Follow,
+        request_id: "caller-stream-id".to_string(),
+        stream_response: false,
+    };
+    let result = timeout(TEST_TIMEOUT, client.http_request_stream(request))
+        .await
+        .context("oversized body delta should close the executor transport")?;
+    let error = match result {
+        Ok(_) => bail!("oversized body delta should fail the request"),
+        Err(error) => error,
+    };
+    let error = error.to_string();
+    assert_eq!(error, "exec-server transport disconnected");
+
+    finish_tx.send(()).expect("server task should stay active");
+    drop(client);
+    server.finish().await?;
+    Ok(())
+}
+
+/// What this tests: frame-count backpressure cannot hide an unbounded amount
+/// of executor-controlled body bytes across the orchestrator's stream queues.
+#[tokio::test]
+async fn http_response_body_stream_enforces_queued_byte_budget() -> Result<()> {
+    let (finish_tx, finish_rx) = oneshot::channel();
+    let server = spawn_scripted_exec_server(|mut peer| async move {
+        let (request_id, params) = peer.read_http_request().await?;
+        assert_eq!(
+            params,
+            HttpRequestParams {
+                method: "GET".to_string(),
+                url: "https://example.test/mcp/byte-budget".to_string(),
+                headers: Vec::new(),
+                body: None,
+                timeout_ms: None,
+                redirect_policy: HttpRedirectPolicy::Follow,
+                request_id: "http-1".to_string(),
+                stream_response: true,
+            }
+        );
+        peer.write_response(
+            request_id,
+            HttpRequestResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: Vec::new().into(),
+            },
+        )
+        .await?;
+
+        let frame_count = HTTP_BODY_DELTA_BYTE_BUDGET / MAX_HTTP_BODY_DELTA_BYTES + 1;
+        for seq in 1..=frame_count as u64 {
+            peer.write_body_delta(HttpRequestBodyDeltaNotification {
+                request_id: "http-1".to_string(),
+                seq,
+                delta: vec![0; MAX_HTTP_BODY_DELTA_BYTES].into(),
+                done: false,
+                error: None,
+            })
+            .await?;
+        }
+
+        let (barrier_request_id, barrier_params) = peer.read_http_request().await?;
+        assert_eq!(
+            barrier_params,
+            HttpRequestParams {
+                method: "GET".to_string(),
+                url: "https://example.test/mcp/byte-budget-barrier".to_string(),
+                headers: Vec::new(),
+                body: None,
+                timeout_ms: None,
+                redirect_policy: HttpRedirectPolicy::Follow,
+                request_id: "http-2".to_string(),
+                stream_response: true,
+            }
+        );
+        peer.write_response(
+            barrier_request_id,
+            HttpRequestResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: Vec::new().into(),
+            },
+        )
+        .await?;
+        peer.write_body_delta(HttpRequestBodyDeltaNotification {
+            request_id: "http-2".to_string(),
+            seq: 1,
+            delta: Vec::new().into(),
+            done: true,
+            error: None,
+        })
+        .await?;
+        finish_rx.await.expect("test should finish server task");
+        Ok(())
+    })
+    .await?;
+    let client = server.connect_client().await?;
+
+    let (_response, mut body_stream) = timeout(
+        TEST_TIMEOUT,
+        client.http_request_stream(HttpRequestParams {
+            method: "GET".to_string(),
+            url: "https://example.test/mcp/byte-budget".to_string(),
+            headers: Vec::new(),
+            body: None,
+            timeout_ms: None,
+            redirect_policy: HttpRedirectPolicy::Follow,
+            request_id: "caller-stream-id".to_string(),
+            stream_response: false,
+        }),
+    )
+    .await
+    .context("streamed http/request should return headers")??;
+
+    // Receiving this terminal notification proves the earlier byte-budget
+    // notifications have all passed through the ordered notification handler.
+    let (_response, mut barrier_stream) = timeout(
+        BYTE_BUDGET_TEST_TIMEOUT,
+        client.http_request_stream(HttpRequestParams {
+            method: "GET".to_string(),
+            url: "https://example.test/mcp/byte-budget-barrier".to_string(),
+            headers: Vec::new(),
+            body: None,
+            timeout_ms: None,
+            redirect_policy: HttpRedirectPolicy::Follow,
+            request_id: "caller-barrier-id".to_string(),
+            stream_response: false,
+        }),
+    )
+    .await
+    .context("barrier http/request should return headers")??;
+    assert_eq!(
+        timeout(TEST_TIMEOUT, barrier_stream.recv())
+            .await
+            .context("barrier body stream should finish")??,
+        None
+    );
+
+    let mut delivered_bytes = 0;
+    let error = loop {
+        match timeout(TEST_TIMEOUT, body_stream.recv())
+            .await
+            .context("queued body stream should finish")?
+        {
+            Ok(Some(chunk)) => delivered_bytes += chunk.len(),
+            Ok(None) => bail!("byte-budget exhaustion should not look like clean EOF"),
+            Err(error) => break error,
+        }
+    };
+    assert_eq!(delivered_bytes, HTTP_BODY_DELTA_BYTE_BUDGET);
+    assert!(
+        error
+            .to_string()
+            .contains("queued body deltas exceed 16777216 bytes")
+    );
+
+    finish_tx.send(()).expect("server task should stay active");
+    drop(client);
+    server.finish().await?;
+    Ok(())
+}
+
+/// What this tests: every response stream on one executor connection shares
+/// the same queued-body byte budget.
+#[tokio::test]
+async fn http_response_body_streams_share_queued_byte_budget() -> Result<()> {
+    let (finish_tx, finish_rx) = oneshot::channel();
+    let server = spawn_scripted_exec_server(|mut peer| async move {
+        for (request_id, url) in [
+            ("http-1", "https://example.test/mcp/shared-budget-one"),
+            ("http-2", "https://example.test/mcp/shared-budget-two"),
+        ] {
+            let (rpc_request_id, params) = peer.read_http_request().await?;
+            assert_eq!(
+                params,
+                HttpRequestParams {
+                    method: "GET".to_string(),
+                    url: url.to_string(),
+                    headers: Vec::new(),
+                    body: None,
+                    timeout_ms: None,
+                    redirect_policy: HttpRedirectPolicy::Follow,
+                    request_id: request_id.to_string(),
+                    stream_response: true,
+                }
+            );
+            peer.write_response(
+                rpc_request_id,
+                HttpRequestResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: Vec::new().into(),
+                },
+            )
+            .await?;
+        }
+
+        let frames_per_stream = HTTP_BODY_DELTA_BYTE_BUDGET / MAX_HTTP_BODY_DELTA_BYTES / 2;
+        for request_id in ["http-1", "http-2"] {
+            for seq in 1..=frames_per_stream as u64 {
+                peer.write_body_delta(HttpRequestBodyDeltaNotification {
+                    request_id: request_id.to_string(),
+                    seq,
+                    delta: vec![0; MAX_HTTP_BODY_DELTA_BYTES].into(),
+                    done: false,
+                    error: None,
+                })
+                .await?;
+            }
+        }
+        peer.write_body_delta(HttpRequestBodyDeltaNotification {
+            request_id: "http-2".to_string(),
+            seq: frames_per_stream as u64 + 1,
+            delta: vec![0; MAX_HTTP_BODY_DELTA_BYTES].into(),
+            done: false,
+            error: None,
+        })
+        .await?;
+
+        let (barrier_request_id, barrier_params) = peer.read_http_request().await?;
+        assert_eq!(
+            barrier_params,
+            HttpRequestParams {
+                method: "GET".to_string(),
+                url: "https://example.test/mcp/shared-budget-barrier".to_string(),
+                headers: Vec::new(),
+                body: None,
+                timeout_ms: None,
+                redirect_policy: HttpRedirectPolicy::Follow,
+                request_id: "http-3".to_string(),
+                stream_response: true,
+            }
+        );
+        peer.write_response(
+            barrier_request_id,
+            HttpRequestResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: Vec::new().into(),
+            },
+        )
+        .await?;
+        for (request_id, seq) in [
+            ("http-3", 1),
+            ("http-1", frames_per_stream as u64 + 1),
+            ("http-2", frames_per_stream as u64 + 2),
+        ] {
+            peer.write_body_delta(HttpRequestBodyDeltaNotification {
+                request_id: request_id.to_string(),
+                seq,
+                delta: Vec::new().into(),
+                done: true,
+                error: None,
+            })
+            .await?;
+        }
+        finish_rx.await.expect("test should finish server task");
+        Ok(())
+    })
+    .await?;
+    let client = server.connect_client().await?;
+
+    let (_response, mut first_stream) = timeout(
+        TEST_TIMEOUT,
+        client.http_request_stream(HttpRequestParams {
+            method: "GET".to_string(),
+            url: "https://example.test/mcp/shared-budget-one".to_string(),
+            headers: Vec::new(),
+            body: None,
+            timeout_ms: None,
+            redirect_policy: HttpRedirectPolicy::Follow,
+            request_id: "caller-stream-one".to_string(),
+            stream_response: false,
+        }),
+    )
+    .await
+    .context("first streamed http/request should return headers")??;
+    let (_response, mut second_stream) = timeout(
+        TEST_TIMEOUT,
+        client.http_request_stream(HttpRequestParams {
+            method: "GET".to_string(),
+            url: "https://example.test/mcp/shared-budget-two".to_string(),
+            headers: Vec::new(),
+            body: None,
+            timeout_ms: None,
+            redirect_policy: HttpRedirectPolicy::Follow,
+            request_id: "caller-stream-two".to_string(),
+            stream_response: false,
+        }),
+    )
+    .await
+    .context("second streamed http/request should return headers")??;
+
+    // This terminal notification is ordered after both streams contend for the
+    // budget, so neither stream is drained before the overflow is observed.
+    let (_response, mut barrier_stream) = timeout(
+        BYTE_BUDGET_TEST_TIMEOUT,
+        client.http_request_stream(HttpRequestParams {
+            method: "GET".to_string(),
+            url: "https://example.test/mcp/shared-budget-barrier".to_string(),
+            headers: Vec::new(),
+            body: None,
+            timeout_ms: None,
+            redirect_policy: HttpRedirectPolicy::Follow,
+            request_id: "caller-barrier-id".to_string(),
+            stream_response: false,
+        }),
+    )
+    .await
+    .context("barrier http/request should return headers")??;
+    assert_eq!(
+        timeout(TEST_TIMEOUT, barrier_stream.recv())
+            .await
+            .context("barrier body stream should finish")??,
+        None
+    );
+
+    let mut failed_stream_bytes = 0;
+    let error = loop {
+        match timeout(TEST_TIMEOUT, second_stream.recv())
+            .await
+            .context("second body stream should finish")?
+        {
+            Ok(Some(chunk)) => failed_stream_bytes += chunk.len(),
+            Ok(None) => bail!("shared byte-budget exhaustion should not look like clean EOF"),
+            Err(error) => break error,
+        }
+    };
+    assert_eq!(
+        (failed_stream_bytes, error.to_string()),
+        (
+            HTTP_BODY_DELTA_BYTE_BUDGET / 2,
+            "exec-server protocol error: http response stream `http-2` failed: queued body deltas exceed 16777216 bytes".to_string(),
+        )
+    );
+
+    let mut surviving_stream_bytes = 0;
+    while let Some(chunk) = timeout(TEST_TIMEOUT, first_stream.recv())
+        .await
+        .context("first body stream should finish")??
+    {
+        surviving_stream_bytes += chunk.len();
+    }
+    assert_eq!(surviving_stream_bytes, HTTP_BODY_DELTA_BYTE_BUDGET / 2);
+
+    finish_tx.send(()).expect("server task should stay active");
+    drop(client);
+    server.finish().await?;
+    Ok(())
+}
+
+/// What this tests: transport disconnect still records a terminal stream
+/// failure even when the client-side body-delta queue is already full.
+#[tokio::test]
+async fn http_response_body_stream_reports_disconnect_when_queue_is_full() -> Result<()> {
+    // Phase 1: fill the queued body-delta route exactly to capacity before the
+    // response headers arrive, then drop the transport without sending EOF.
+    let server = spawn_scripted_exec_server(|mut peer| async move {
+        let (request_id, params) = peer.read_http_request().await?;
+        assert_eq!(
+            params,
+            HttpRequestParams {
+                method: "GET".to_string(),
+                url: "https://example.test/mcp/disconnect-full-queue".to_string(),
+                headers: Vec::new(),
+                body: None,
+                timeout_ms: None,
+                redirect_policy: HttpRedirectPolicy::Follow,
+                request_id: "http-1".to_string(),
+                stream_response: true,
+            }
+        );
+        for seq in 1..=HTTP_BODY_DELTA_CHANNEL_CAPACITY {
+            peer.write_body_delta(HttpRequestBodyDeltaNotification {
+                request_id: "http-1".to_string(),
+                seq,
+                delta: b"x".to_vec().into(),
+                done: false,
+                error: None,
+            })
+            .await?;
+        }
+        peer.write_response(
+            request_id,
+            HttpRequestResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: Vec::new().into(),
+            },
+        )
+        .await
+    })
+    .await?;
+    let client = server.connect_client().await?;
+
+    // Phase 2: start the streaming request and receive headers while the
+    // queue is already full.
+    let (_response, mut body_stream) = timeout(
+        TEST_TIMEOUT,
+        client.http_request_stream(HttpRequestParams {
+            method: "GET".to_string(),
+            url: "https://example.test/mcp/disconnect-full-queue".to_string(),
+            headers: Vec::new(),
+            body: None,
+            timeout_ms: None,
+            redirect_policy: HttpRedirectPolicy::Follow,
+            request_id: "caller-stream-id".to_string(),
+            stream_response: false,
+        }),
+    )
+    .await
+    .context("streamed http/request should return headers")??;
+
+    // Phase 3: drain the queued chunks and assert the transport disconnect is
+    // still reported as an error rather than a clean EOF.
+    let mut chunks = 0;
+    let error = loop {
+        match timeout(TEST_TIMEOUT, body_stream.recv())
+            .await
+            .context("disconnect should wake the full queued body stream")?
+        {
+            Ok(Some(_chunk)) => {
+                chunks += 1;
+            }
+            Ok(None) => bail!("disconnect with a full queue should not look like clean EOF"),
+            Err(error) => break error,
+        }
+    };
+    assert_eq!(
+        (
+            chunks,
+            error
+                .to_string()
+                .starts_with(
+                    "exec-server protocol error: http response stream `http-1` failed: exec-server transport disconnected",
+                ),
+        ),
+        (HTTP_BODY_DELTA_CHANNEL_CAPACITY as usize, true)
+    );
+
+    drop(client);
+    server.finish().await?;
+    Ok(())
+}
+
 /// What this tests: body-delta backpressure closes the public body stream as
 /// an error rather than letting callers accept a truncated body as clean EOF.
 #[tokio::test]
@@ -759,7 +1276,8 @@ async fn http_response_body_stream_reports_backpressure_truncation() -> Result<(
                 headers: Vec::new(),
                 body: None,
                 timeout_ms: None,
-                request_id: Some("http-1".to_string()),
+                redirect_policy: HttpRedirectPolicy::Follow,
+                request_id: "http-1".to_string(),
                 stream_response: true,
             }
         );
@@ -801,7 +1319,8 @@ async fn http_response_body_stream_reports_backpressure_truncation() -> Result<(
             headers: Vec::new(),
             body: None,
             timeout_ms: None,
-            request_id: Some("caller-stream-id".to_string()),
+            redirect_policy: HttpRedirectPolicy::Follow,
+            request_id: "caller-stream-id".to_string(),
             stream_response: false,
         }),
     )
@@ -858,6 +1377,7 @@ impl ScriptedExecServer {
         ExecServerClient::connect_websocket(RemoteExecServerConnectArgs::new(
             self.websocket_url.clone(),
             CLIENT_NAME.to_string(),
+            HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
         ))
         .await
         .context("client should connect to fake exec-server")
@@ -920,6 +1440,7 @@ impl JsonRpcPeer {
             request.id,
             InitializeResponse {
                 session_id: "session-1".to_string(),
+                environment_info: None,
             },
         )
         .await?;

@@ -6,7 +6,16 @@ use codex_protocol::protocol::HookRunStatus;
 use codex_protocol::protocol::HookRunSummary;
 
 use crate::engine::ConfiguredHandler;
+use crate::engine::HandlerSourcePath;
 use crate::engine::dispatcher;
+use crate::output_spill::AdditionalContext;
+
+/// Identifies a thread-spawned subagent when a normal hook runs inside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentHookContext {
+    pub agent_id: String,
+    pub agent_type: String,
+}
 
 pub(crate) fn join_text_chunks(chunks: Vec<String>) -> Option<String> {
     if chunks.is_empty() {
@@ -27,19 +36,23 @@ pub(crate) fn trimmed_non_empty(text: &str) -> Option<String> {
 
 pub(crate) fn append_additional_context(
     entries: &mut Vec<HookOutputEntry>,
-    additional_contexts_for_model: &mut Vec<String>,
+    additional_contexts_for_model: &mut Vec<AdditionalContext>,
+    handler: &ConfiguredHandler,
     additional_context: String,
 ) {
     entries.push(HookOutputEntry {
         kind: HookOutputEntryKind::Context,
         text: additional_context.clone(),
     });
-    additional_contexts_for_model.push(additional_context);
+    additional_contexts_for_model.push(AdditionalContext {
+        text: additional_context,
+        limit: handler.additional_context_limit,
+    });
 }
 
 pub(crate) fn flatten_additional_contexts<'a>(
-    additional_contexts: impl IntoIterator<Item = &'a [String]>,
-) -> Vec<String> {
+    additional_contexts: impl IntoIterator<Item = &'a [AdditionalContext]>,
+) -> Vec<AdditionalContext> {
     additional_contexts
         .into_iter()
         .flat_map(|chunk| chunk.iter().cloned())
@@ -53,6 +66,7 @@ pub(crate) fn serialization_failure_hook_events(
 ) -> Vec<HookCompletedEvent> {
     handlers
         .into_iter()
+        .filter(|handler| matches!(handler.source_path, HandlerSourcePath::Local(_)))
         .map(|handler| {
             let mut run = dispatcher::running_summary(&handler);
             run.status = HookRunStatus::Failed;
@@ -103,34 +117,32 @@ pub(crate) fn matcher_pattern_for_event(
         HookEventName::PreToolUse
         | HookEventName::PermissionRequest
         | HookEventName::PostToolUse
-        | HookEventName::SessionStart => matcher,
-        HookEventName::UserPromptSubmit | HookEventName::Stop => None,
+        | HookEventName::SessionStart
+        | HookEventName::SessionEnd
+        | HookEventName::SubagentStart
+        | HookEventName::SubagentStop
+        | HookEventName::PreCompact
+        | HookEventName::PostCompact => matcher,
+        HookEventName::UserPromptSubmit | HookEventName::Stop | HookEventName::Interrupt => None,
     }
 }
 
-pub(crate) fn validate_matcher_pattern(matcher: &str) -> Result<(), regex::Error> {
-    if is_match_all_matcher(matcher) {
-        return Ok(());
-    }
-    regex::Regex::new(matcher).map(|_| ())
+pub(crate) fn matches_matcher(
+    matcher: Option<&crate::engine::HookMatcher>,
+    input: Option<&str>,
+) -> bool {
+    matcher.is_none_or(|matcher| matcher.matches(input))
 }
 
-pub(crate) fn matches_matcher(matcher: Option<&str>, input: Option<&str>) -> bool {
-    match matcher {
-        None => true,
-        Some(matcher) if is_match_all_matcher(matcher) => true,
-        Some(matcher) => input
-            .and_then(|input| {
-                regex::Regex::new(matcher)
-                    .ok()
-                    .map(|regex| regex.is_match(input))
-            })
-            .unwrap_or(false),
-    }
-}
-
-fn is_match_all_matcher(matcher: &str) -> bool {
-    matcher.is_empty() || matcher == "*"
+pub(crate) fn matcher_inputs<'a>(
+    tool_name: &'a str,
+    matcher_aliases: &'a [String],
+) -> Vec<&'a str> {
+    // Keep the canonical name first so matcher previews and execution preserve
+    // the same primary identity that hook stdin will serialize.
+    std::iter::once(tool_name)
+        .chain(matcher_aliases.iter().map(String::as_str))
+        .collect()
 }
 
 #[cfg(test)]
@@ -140,7 +152,7 @@ mod tests {
 
     use super::matcher_pattern_for_event;
     use super::matches_matcher;
-    use super::validate_matcher_pattern;
+    use crate::engine::HookMatcher;
 
     #[test]
     fn matcher_omitted_matches_all_occurrences() {
@@ -150,37 +162,110 @@ mod tests {
 
     #[test]
     fn matcher_star_matches_all_occurrences() {
-        assert!(matches_matcher(Some("*"), Some("Bash")));
-        assert!(matches_matcher(Some("*"), Some("Edit")));
-        assert_eq!(validate_matcher_pattern("*"), Ok(()));
+        assert!(matches_matcher(
+            Some(&HookMatcher::new("*").expect("valid matcher")),
+            Some("Bash")
+        ));
+        assert!(matches_matcher(
+            Some(&HookMatcher::new("*").expect("valid matcher")),
+            Some("Edit")
+        ));
+        assert_eq!(HookMatcher::new("*").map(|_| ()), Ok(()));
     }
 
     #[test]
     fn matcher_empty_string_matches_all_occurrences() {
-        assert!(matches_matcher(Some(""), Some("Bash")));
-        assert!(matches_matcher(Some(""), Some("SessionStart")));
-        assert_eq!(validate_matcher_pattern(""), Ok(()));
+        assert!(matches_matcher(
+            Some(&HookMatcher::new("").expect("valid matcher")),
+            Some("Bash")
+        ));
+        assert!(matches_matcher(
+            Some(&HookMatcher::new("").expect("valid matcher")),
+            Some("SessionStart")
+        ));
+        assert_eq!(HookMatcher::new("").map(|_| ()), Ok(()));
     }
 
     #[test]
-    fn matcher_uses_regex_matching() {
-        assert!(matches_matcher(Some("Edit|Write"), Some("Edit")));
-        assert!(matches_matcher(Some("Edit|Write"), Some("Write")));
-        assert!(!matches_matcher(Some("Edit|Write"), Some("Bash")));
-        assert_eq!(validate_matcher_pattern("Edit|Write"), Ok(()));
+    fn exact_matcher_supports_pipe_alternatives() {
+        assert!(matches_matcher(
+            Some(&HookMatcher::new("Edit|Write").expect("valid matcher")),
+            Some("Edit")
+        ));
+        assert!(matches_matcher(
+            Some(&HookMatcher::new("Edit|Write").expect("valid matcher")),
+            Some("Write")
+        ));
+        assert!(!matches_matcher(
+            Some(&HookMatcher::new("Edit|Write").expect("valid matcher")),
+            Some("Bash")
+        ));
+        assert_eq!(HookMatcher::new("Edit|Write").map(|_| ()), Ok(()));
+    }
+
+    #[test]
+    fn literal_matcher_uses_exact_matching() {
+        assert!(matches_matcher(
+            Some(&HookMatcher::new("Bash").expect("valid matcher")),
+            Some("Bash")
+        ));
+        assert!(!matches_matcher(
+            Some(&HookMatcher::new("Bash").expect("valid matcher")),
+            Some("BashOutput")
+        ));
+        assert!(matches_matcher(
+            Some(&HookMatcher::new("mcp__memory__create_entities").expect("valid matcher")),
+            Some("mcp__memory__create_entities")
+        ));
+        assert!(!matches_matcher(
+            Some(&HookMatcher::new("mcp__memory").expect("valid matcher")),
+            Some("mcp__memory__create_entities")
+        ));
+        assert_eq!(HookMatcher::new("mcp__memory").map(|_| ()), Ok(()));
+    }
+
+    #[test]
+    fn matcher_uses_regex_when_it_contains_regex_characters() {
+        assert!(matches_matcher(
+            Some(&HookMatcher::new("^Bash").expect("valid matcher")),
+            Some("BashOutput")
+        ));
+        assert_eq!(HookMatcher::new("^Bash").map(|_| ()), Ok(()));
+    }
+
+    #[test]
+    fn mcp_matchers_support_regex_wildcards() {
+        assert!(matches_matcher(
+            Some(&HookMatcher::new("mcp__memory__.*").expect("valid matcher")),
+            Some("mcp__memory__create_entities")
+        ));
+        assert!(matches_matcher(
+            Some(&HookMatcher::new("mcp__.*__write.*").expect("valid matcher")),
+            Some("mcp__filesystem__write_file")
+        ));
+        assert!(!matches_matcher(
+            Some(&HookMatcher::new("mcp__.*__write.*").expect("valid matcher")),
+            Some("mcp__filesystem__read_file")
+        ));
+        assert_eq!(HookMatcher::new("mcp__memory__.*").map(|_| ()), Ok(()));
     }
 
     #[test]
     fn matcher_supports_anchored_regexes() {
-        assert!(matches_matcher(Some("^Bash$"), Some("Bash")));
-        assert!(!matches_matcher(Some("^Bash$"), Some("BashOutput")));
-        assert_eq!(validate_matcher_pattern("^Bash$"), Ok(()));
+        assert!(matches_matcher(
+            Some(&HookMatcher::new("^Bash$").expect("valid matcher")),
+            Some("Bash")
+        ));
+        assert!(!matches_matcher(
+            Some(&HookMatcher::new("^Bash$").expect("valid matcher")),
+            Some("BashOutput")
+        ));
+        assert_eq!(HookMatcher::new("^Bash$").map(|_| ()), Ok(()));
     }
 
     #[test]
     fn invalid_regex_is_rejected() {
-        assert!(validate_matcher_pattern("[").is_err());
-        assert!(!matches_matcher(Some("["), Some("Bash")));
+        assert!(HookMatcher::new("[").is_err());
     }
 
     #[test]
@@ -191,6 +276,10 @@ mod tests {
         );
         assert_eq!(
             matcher_pattern_for_event(HookEventName::Stop, Some("^done$")),
+            None
+        );
+        assert_eq!(
+            matcher_pattern_for_event(HookEventName::Interrupt, Some("^interrupted$")),
             None
         );
     }
@@ -208,6 +297,18 @@ mod tests {
         assert_eq!(
             matcher_pattern_for_event(HookEventName::SessionStart, Some("startup|resume")),
             Some("startup|resume")
+        );
+        assert_eq!(
+            matcher_pattern_for_event(HookEventName::SessionEnd, Some("clear|other")),
+            Some("clear|other")
+        );
+        assert_eq!(
+            matcher_pattern_for_event(HookEventName::PreCompact, Some("^auto$")),
+            Some("^auto$")
+        );
+        assert_eq!(
+            matcher_pattern_for_event(HookEventName::PostCompact, Some("manual|auto")),
+            Some("manual|auto")
         );
     }
 }

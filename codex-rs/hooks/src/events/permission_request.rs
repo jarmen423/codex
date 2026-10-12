@@ -16,13 +16,13 @@
 use std::path::PathBuf;
 
 use super::common;
-use crate::engine::CommandShell;
+use crate::engine::ClaudeHooksEngine;
 use crate::engine::ConfiguredHandler;
-use crate::engine::command_runner::CommandRunResult;
+use crate::engine::HandlerRunResult;
 use crate::engine::dispatcher;
 use crate::engine::output_parser;
 use crate::schema::PermissionRequestCommandInput;
-use crate::schema::PermissionRequestToolInput;
+use crate::schema::SubagentCommandInputFields;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::HookCompletedEvent;
 use codex_protocol::protocol::HookEventName;
@@ -30,19 +30,21 @@ use codex_protocol::protocol::HookOutputEntry;
 use codex_protocol::protocol::HookOutputEntryKind;
 use codex_protocol::protocol::HookRunStatus;
 use codex_protocol::protocol::HookRunSummary;
+use serde_json::Value;
 
 #[derive(Debug, Clone)]
 pub struct PermissionRequestRequest {
     pub session_id: ThreadId,
     pub turn_id: String,
+    pub subagent: Option<common::SubagentHookContext>,
     pub cwd: PathBuf,
     pub transcript_path: Option<PathBuf>,
     pub model: String,
     pub permission_mode: String,
     pub tool_name: String,
+    pub matcher_aliases: Vec<String>,
     pub run_id_suffix: String,
-    pub command: String,
-    pub description: Option<String>,
+    pub tool_input: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,10 +68,11 @@ pub(crate) fn preview(
     handlers: &[ConfiguredHandler],
     request: &PermissionRequestRequest,
 ) -> Vec<HookRunSummary> {
-    dispatcher::select_handlers(
+    let matcher_inputs = common::matcher_inputs(&request.tool_name, &request.matcher_aliases);
+    dispatcher::select_handlers_for_matcher_inputs(
         handlers,
         HookEventName::PermissionRequest,
-        Some(&request.tool_name),
+        &matcher_inputs,
     )
     .into_iter()
     .map(|handler| {
@@ -82,14 +85,14 @@ pub(crate) fn preview(
 }
 
 pub(crate) async fn run(
-    handlers: &[ConfiguredHandler],
-    shell: &CommandShell,
+    engine: &ClaudeHooksEngine,
     request: PermissionRequestRequest,
 ) -> PermissionRequestOutcome {
-    let matched = dispatcher::select_handlers(
-        handlers,
+    let matcher_inputs = common::matcher_inputs(&request.tool_name, &request.matcher_aliases);
+    let matched = dispatcher::select_handlers_for_matcher_inputs(
+        &engine.handlers,
         HookEventName::PermissionRequest,
-        Some(&request.tool_name),
+        &matcher_inputs,
     );
     if matched.is_empty() {
         return PermissionRequestOutcome {
@@ -115,7 +118,7 @@ pub(crate) async fn run(
     };
 
     let results = dispatcher::execute_handlers(
-        shell,
+        engine,
         matched,
         input_json,
         request.cwd.as_path(),
@@ -166,25 +169,25 @@ fn resolve_permission_request_decision<'a>(
 }
 
 fn build_command_input(request: &PermissionRequestRequest) -> PermissionRequestCommandInput {
+    let subagent = SubagentCommandInputFields::from(request.subagent.as_ref());
     PermissionRequestCommandInput {
         session_id: request.session_id.to_string(),
         turn_id: request.turn_id.clone(),
+        agent_id: subagent.agent_id,
+        agent_type: subagent.agent_type,
         transcript_path: crate::schema::NullableString::from_path(request.transcript_path.clone()),
         cwd: request.cwd.display().to_string(),
         hook_event_name: "PermissionRequest".to_string(),
         model: request.model.clone(),
         permission_mode: request.permission_mode.clone(),
         tool_name: request.tool_name.clone(),
-        tool_input: PermissionRequestToolInput {
-            command: request.command.clone(),
-            description: request.description.clone(),
-        },
+        tool_input: request.tool_input.clone(),
     }
 }
 
 fn parse_completed(
     handler: &ConfiguredHandler,
-    run_result: CommandRunResult,
+    run_result: HandlerRunResult,
     turn_id: Option<String>,
 ) -> dispatcher::ParsedHandler<PermissionRequestHandlerData> {
     let mut entries = Vec::new();
@@ -212,28 +215,30 @@ fn parse_completed(
                             text: system_message,
                         });
                     }
-                    if let Some(invalid_reason) = parsed.invalid_reason {
-                        status = HookRunStatus::Failed;
-                        entries.push(HookOutputEntry {
-                            kind: HookOutputEntryKind::Error,
-                            text: invalid_reason,
-                        });
-                    } else if let Some(parsed_decision) = parsed.decision {
-                        match parsed_decision {
-                            output_parser::PermissionRequestDecision::Allow => {
-                                decision = Some(PermissionRequestDecision::Allow);
-                            }
-                            output_parser::PermissionRequestDecision::Deny { message } => {
-                                status = HookRunStatus::Blocked;
-                                entries.push(HookOutputEntry {
-                                    kind: HookOutputEntryKind::Feedback,
-                                    text: message.clone(),
-                                });
-                                decision = Some(PermissionRequestDecision::Deny { message });
+                    if handler.can_apply_control_effects() {
+                        if let Some(invalid_reason) = parsed.invalid_reason {
+                            status = HookRunStatus::Failed;
+                            entries.push(HookOutputEntry {
+                                kind: HookOutputEntryKind::Error,
+                                text: invalid_reason,
+                            });
+                        } else if let Some(parsed_decision) = parsed.decision {
+                            match parsed_decision {
+                                output_parser::PermissionRequestDecision::Allow => {
+                                    decision = Some(PermissionRequestDecision::Allow);
+                                }
+                                output_parser::PermissionRequestDecision::Deny { message } => {
+                                    status = HookRunStatus::Blocked;
+                                    entries.push(HookOutputEntry {
+                                        kind: HookOutputEntryKind::Feedback,
+                                        text: message.clone(),
+                                    });
+                                    decision = Some(PermissionRequestDecision::Deny { message });
+                                }
                             }
                         }
                     }
-                } else if trimmed_stdout.starts_with('{') || trimmed_stdout.starts_with('[') {
+                } else if output_parser::looks_like_json(&run_result.stdout) {
                     status = HookRunStatus::Failed;
                     entries.push(HookOutputEntry {
                         kind: HookOutputEntryKind::Error,
@@ -241,7 +246,7 @@ fn parse_completed(
                     });
                 }
             }
-            Some(2) => {
+            Some(2) if handler.can_apply_control_effects() => {
                 if let Some(message) = common::trimmed_non_empty(&run_result.stderr) {
                     status = HookRunStatus::Blocked;
                     entries.push(HookOutputEntry {
@@ -282,6 +287,7 @@ fn parse_completed(
     dispatcher::ParsedHandler {
         completed,
         data: PermissionRequestHandlerData { decision },
+        completion_order: 0,
     }
 }
 

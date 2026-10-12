@@ -23,7 +23,7 @@ use tracing::info_span;
 
 pub(crate) fn request_span(
     request: &JSONRPCRequest,
-    transport: AppServerTransport,
+    transport: &AppServerTransport,
     connection_id: ConnectionId,
     session: &ConnectionSessionState,
 ) -> Span {
@@ -64,8 +64,8 @@ pub(crate) fn typed_request_span(
     connection_id: ConnectionId,
     session: &ConnectionSessionState,
 ) -> Span {
-    let method = request.method();
-    let span = app_server_request_span_template(&method, "in-process", request.id(), connection_id);
+    let method = request.method_name();
+    let span = app_server_request_span_template(method, "in-process", request.id(), connection_id);
 
     let client_info = initialize_client_info_from_typed_request(request);
     record_client_info(
@@ -78,13 +78,14 @@ pub(crate) fn typed_request_span(
             .or(session.client_version()),
     );
 
-    attach_parent_context(&span, &method, request.id(), /*parent_trace*/ None);
+    attach_parent_context(&span, method, request.id(), /*parent_trace*/ None);
     span
 }
 
-fn transport_name(transport: AppServerTransport) -> &'static str {
+fn transport_name(transport: &AppServerTransport) -> &'static str {
     match transport {
         AppServerTransport::Stdio => "stdio",
+        AppServerTransport::UnixSocket { .. } => "unix_socket",
         AppServerTransport::WebSocket { .. } => "websocket",
         AppServerTransport::Off => "off",
     }

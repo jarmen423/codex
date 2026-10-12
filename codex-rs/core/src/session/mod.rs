@@ -1,3 +1,7 @@
+pub(crate) mod startup;
+
+use crate::WithTurnExtensionData;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Debug;
@@ -7,102 +11,157 @@ use std::sync::atomic::AtomicU64;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-use crate::agent::AgentControl;
 use crate::agent::AgentStatus;
-use crate::agent::Mailbox;
-use crate::agent::MailboxReceiver;
 use crate::agent::agent_status_from_event;
+use crate::agent::api::AgentConfigUpdate;
+use crate::agent::api::AgentTurnOutcome;
+use crate::agent::control::AgentControlInit;
 use crate::agent::status::is_final;
-use crate::agent_identity::AgentIdentityManager;
-use crate::apps::render_apps_section;
-use crate::commit_attribution::commit_message_trailer_instruction;
+use crate::agents_md_manager::SessionInstructions;
+use crate::attestation::AttestationProvider;
 use crate::compact;
+use crate::compact::CompactedHistoryMetadata;
 use crate::config::ManagedFeatures;
-use crate::connectors;
 use crate::context::ContextualUserFragment;
-use crate::default_skill_metadata_budget;
+use crate::context::DeveloperInstructions;
+use crate::context::GuardianPolicy;
+use crate::context::ManagedDeveloperInstructions;
+use crate::context::ModelSwitchInstructions;
+use crate::context::MultiAgentRoleInstructions;
+use crate::context::NetworkRuleSaved;
+use crate::context::RecommendedPluginsInstructions;
+use crate::context::world_state::Placement;
+use crate::context::world_state::WorldState;
+use crate::context::world_state::WorldStateSnapshot;
+use crate::context::world_state::WorldStateUpdate;
+use crate::context::world_state::WorldStateUpdateContent;
+use crate::context::world_state::split_prefix_updates;
+use crate::current_time::TimeProvider;
+use crate::environment_selection::TurnEnvironmentSnapshot;
+use crate::exec_policy::BANNED_PREFIX_SUGGESTIONS;
 use crate::exec_policy::ExecPolicyManager;
-use crate::installation_id::resolve_installation_id;
+use crate::exec_policy::default_policy_path;
+use crate::image_preparation::ImagePreparationMode;
+use crate::image_preparation::ImageResizeNoticeMode;
+use crate::image_preparation::prepare_response_items as prepare_image_response_items;
+use crate::image_preparation::unified_image_budget_enabled;
 use crate::parse_turn_item;
-use crate::path_utils::normalize_for_native_workdir;
 use crate::realtime_conversation::RealtimeConversationManager;
-use crate::render_skills_section;
-use crate::rollout::find_thread_name_by_id;
-use crate::session_prefix::format_subagent_notification_message;
-use crate::skills::SkillRenderSideEffects;
+use crate::realtime_history::RealtimeEventOrder;
+use crate::session::step_context::StepContext;
+use crate::session::step_settings::ResolvedStepSettings;
+use crate::session::step_settings::StepSettings;
+use crate::session::turn_context::TurnEnvironment;
+use crate::shell_snapshot::SnapshotCredentialBrokerState;
 use crate::skills_load_input_from_config;
+use crate::stream_events_utils::mark_thread_memory_mode_polluted_if_external_context;
 use crate::turn_metadata::TurnMetadataState;
+use crate::turn_timing::now_unix_timestamp_ms;
 use async_channel::Receiver;
 use async_channel::Sender;
+use chrono::DateTime;
 use chrono::Local;
 use chrono::Utc;
 use codex_analytics::AnalyticsEventsClient;
+use codex_analytics::ImagePreparationFact;
+use codex_analytics::ImagePreparationMetadata;
 use codex_analytics::SubAgentThreadStartedInput;
-use codex_app_server_protocol::AuthMode;
-use codex_app_server_protocol::McpServerElicitationRequest;
-use codex_app_server_protocol::McpServerElicitationRequestParams;
-use codex_config::types::OAuthCredentialsStoreMode;
+use codex_analytics::ThreadInitializationMode;
+use codex_analytics::TurnCodexErrorFact;
+use codex_async_utils::OrCancelExt;
+use codex_attachment_store::AttachmentStore;
+use codex_attachment_store::InlineAttachmentStore;
+use codex_connectors::connector_runtime_context_key;
+use codex_context_fragments::RenderedFragment;
 use codex_exec_server::Environment;
 use codex_exec_server::EnvironmentManager;
-use codex_exec_server::FileSystemSandboxContext;
+use codex_execpolicy::prefix_rule_migration;
+use codex_extension_api::ConversationHistorySnapshot;
+use codex_extension_api::ExtensionDataInit;
+use codex_extension_api::PromptSlot;
+use codex_extension_api::TurnContextContributionInput;
 use codex_features::FEATURES;
 use codex_features::Feature;
+use codex_features::Features;
 use codex_features::unstable_features_warning_event;
+use codex_history::HistoryInitialization;
+use codex_history::RolloutItem;
 use codex_hooks::Hooks;
 use codex_hooks::HooksConfig;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::auth_env_telemetry::collect_auth_env_telemetry;
-use codex_login::default_client::originator;
-use codex_mcp::McpConnectionManager;
-use codex_mcp::McpRuntimeEnvironment;
-use codex_mcp::ToolInfo;
-use codex_mcp::codex_apps_tools_cache_key;
-#[cfg(test)]
-use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;
-use codex_models_manager::manager::ModelsManager;
+use codex_mcp::McpResourceClient;
+use codex_mcp::McpRuntime;
+use codex_mcp::McpRuntimeContext;
+use codex_mcp::McpRuntimeInput;
 use codex_models_manager::manager::RefreshStrategy;
+use codex_models_manager::manager::SharedModelsManager;
 use codex_network_proxy::NetworkProxy;
 use codex_network_proxy::NetworkProxyAuditMetadata;
 use codex_network_proxy::normalize_host;
+use codex_otel::auth_storage::AuthStorageOriginator;
 use codex_otel::current_span_trace_id;
 use codex_otel::current_span_w3c_trace_context;
 use codex_otel::set_parent_from_w3c_trace_context;
+use codex_prompts::render_model_instructions;
+use codex_protocol::ResponseUsageMetadata;
+use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
-use codex_protocol::ToolName;
+use codex_protocol::approvals::ElicitationRequest;
 use codex_protocol::approvals::ElicitationRequestEvent;
 use codex_protocol::approvals::ExecPolicyAmendment;
 use codex_protocol::approvals::NetworkPolicyAmendment;
 use codex_protocol::approvals::NetworkPolicyRuleAction;
+use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::config_types::ApprovalsReviewer;
-use codex_protocol::config_types::ModeKind;
-use codex_protocol::config_types::Settings;
+use codex_protocol::config_types::AutoCompactTokenLimitScope;
+use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
+use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
+use codex_protocol::items::EnteredReviewModeItem;
+use codex_protocol::items::ModelInvocationContext;
 use codex_protocol::items::TurnItem;
 use codex_protocol::items::UserMessageItem;
-use codex_protocol::mcp::CallToolResult;
+use codex_protocol::models::ActivePermissionProfile;
+use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::BaseInstructions;
+use codex_protocol::models::BaseInstructionsProvenance;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::ImageReference;
+use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use codex_protocol::models::PermissionProfile;
-use codex_protocol::models::format_allow_prefixes;
+use codex_protocol::models::SandboxEnforcement;
 use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
+use codex_protocol::permissions::FileSystemSandboxPolicyContext;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::HasLegacyEvent;
+use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ItemStartedEvent;
+use codex_protocol::protocol::MULTI_AGENT_MODE_OPEN_TAG;
+use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::RawResponseItemEvent;
-use codex_protocol::protocol::ReviewRequest;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use codex_protocol::protocol::ThreadHistoryMode;
+use codex_protocol::protocol::ThreadSettingsOverrides;
+use codex_protocol::protocol::ThreadSettingsSnapshot;
+use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnContextItem;
-use codex_protocol::protocol::TurnContextNetworkItem;
+use codex_protocol::protocol::TurnEnvironmentRequest;
+use codex_protocol::protocol::TurnEnvironmentSelection;
+use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::W3cTraceContext;
+use codex_protocol::protocol::WorldStateItem;
 use codex_protocol::request_permissions::PermissionGrantScope;
 use codex_protocol::request_permissions::RequestPermissionProfile;
 use codex_protocol::request_permissions::RequestPermissionsArgs;
@@ -111,20 +170,30 @@ use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_protocol::request_user_input::RequestUserInputArgs;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_rmcp_client::ElicitationResponse;
-use codex_rollout::RolloutConfig;
+use codex_rollout::should_persist_response_item;
 use codex_rollout::state_db;
+use codex_rollout_trace::ThreadStartedTraceMetadata;
+use codex_rollout_trace::ThreadTraceContext;
+use codex_sandboxing::SandboxType;
+use codex_sandboxing::policy_transforms::intersect_permission_profiles_with_context;
 use codex_shell_command::parse_command::parse_command;
 use codex_terminal_detection::user_agent;
+use codex_thread_store::CreateThreadParams;
+use codex_thread_store::LiveThread;
+use codex_thread_store::LiveThreadInitGuard;
 use codex_thread_store::LocalThreadStore;
-use codex_utils_output_truncation::TruncationPolicy;
+use codex_thread_store::PersistContext;
+use codex_thread_store::ReadThreadParams;
+use codex_thread_store::ResumeThreadParams;
+use codex_thread_store::ThreadPersistenceMetadata;
+use codex_thread_store::ThreadStore;
+use codex_utils_audio::prepare_response_items as prepare_audio_response_items;
+use codex_utils_git_discovery::GitRootDiscovery;
+use codex_utils_output_truncation::with_serialization_allowance;
+use codex_utils_path_uri::PathUri;
 use futures::future::BoxFuture;
 use futures::future::Shared;
 use futures::prelude::*;
-use rmcp::model::ListResourceTemplatesResult;
-use rmcp::model::ListResourcesResult;
-use rmcp::model::PaginatedRequestParams;
-use rmcp::model::ReadResourceRequestParams;
-use rmcp::model::ReadResourceResult;
 use rmcp::model::RequestId;
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -144,220 +213,210 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::client::ModelClient;
+use crate::codex_thread::CodexThreadSettingsOverrides;
 use crate::codex_thread::ThreadConfigSnapshot;
+#[cfg(test)]
 use crate::compact::collect_user_messages;
 use crate::config::Config;
-use crate::config::Constrained;
 use crate::config::ConstraintResult;
-use crate::config::GhostSnapshotConfig;
+use crate::config::PermissionProfileSnapshot;
+use crate::config::PermissionProfileState;
 use crate::config::StartedNetworkProxy;
 use crate::config::resolve_web_search_mode_for_turn;
 use crate::context_manager::ContextManager;
-use crate::context_manager::TotalTokenUsageBreakdown;
+use crate::context_manager::HistoryReplacement;
 use crate::thread_rollout_truncation::initial_history_has_prior_user_turns;
 use codex_config::CONFIG_TOML_FILE;
+use codex_config::ConfigLayerSource;
 use codex_config::types::McpServerConfig;
-use codex_config::types::ShellEnvironmentPolicy;
+use codex_model_provider::create_model_provider;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_protocol::error::CodexErr;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result as CodexResult;
 #[cfg(test)]
 use codex_protocol::exec_output::StreamOutput;
 
-mod agent_task_lifecycle;
+mod code_mode_warning;
+mod config_refresh;
+pub(crate) mod context_window;
+mod daemon_recovery;
+mod environment;
+mod extension_interruption;
+pub(crate) mod extension_metrics;
+mod guardian_checkpoint;
 mod handlers;
+mod inject;
+mod reasoning_effort;
+mod submission;
+pub(crate) use reasoning_effort::RequestEffortUsage;
+pub(crate) use submission::Submission;
+mod input_queue;
 mod mcp;
+mod mcp_prewarm;
+mod mcp_refresh;
+mod mcp_runtime;
+pub(crate) mod multi_agents;
+mod plugin_selection;
+mod realtime_history;
+mod retained_context;
 mod review;
+mod rollout_budget;
 mod rollout_reconstruction;
 #[allow(clippy::module_inception)]
 pub(crate) mod session;
+pub(crate) mod startup_prewarm;
+mod step_activation;
+pub(crate) mod step_context;
+pub(crate) mod step_settings;
+mod thread_settings;
+pub(crate) mod time_reminder;
+mod token_budget;
 pub(crate) mod turn;
 pub(crate) mod turn_context;
+mod turn_input;
+mod turn_suspension;
+mod world_state;
+use self::code_mode_warning::unsupported_code_mode_warning;
+pub(crate) use self::environment::ThreadEnvironmentDefaults;
 #[cfg(test)]
 use self::handlers::submission_dispatch_span;
 use self::handlers::submission_loop;
+pub(crate) use self::input_queue::InputQueueActivity;
+pub(crate) use self::input_queue::TurnInput;
+pub(crate) use self::input_queue::TurnInputQueue;
+pub(crate) use self::input_queue::UserInputMetadata;
 use self::review::spawn_review_thread;
 use self::session::AppServerClientMetadata;
 use self::session::Session;
 use self::session::SessionConfiguration;
-use self::session::SessionSettingsUpdate;
+use self::session::SessionSettingsCommit;
+pub(crate) use self::session::SessionSettingsUpdate;
 #[cfg(test)]
 use self::turn::AssistantMessageStreamParsers;
+use self::turn::RealtimeEventText;
+use self::turn::agent_message_text;
 #[cfg(test)]
 use self::turn::collect_explicit_app_ids_from_skill_items;
-#[cfg(test)]
-use self::turn::filter_connectors_for_input;
 use self::turn::realtime_text_for_event;
 use self::turn_context::TurnContext;
-use self::turn_context::TurnSkillsContext;
 #[cfg(test)]
 mod rollout_reconstruction_tests;
 
-#[derive(Debug, PartialEq)]
-pub enum SteerInputError {
-    NoActiveTurn(Vec<UserInput>),
-    ExpectedTurnMismatch { expected: String, actual: String },
-    ActiveTurnNotSteerable { turn_kind: NonSteerableTurnKind },
-    EmptyInput,
-}
-
-impl SteerInputError {
-    fn to_error_event(&self) -> ErrorEvent {
-        match self {
-            Self::NoActiveTurn(_) => ErrorEvent {
-                message: "no active turn to steer".to_string(),
-                codex_error_info: Some(CodexErrorInfo::BadRequest),
-            },
-            Self::ExpectedTurnMismatch { expected, actual } => ErrorEvent {
-                message: format!("expected active turn id `{expected}` but found `{actual}`"),
-                codex_error_info: Some(CodexErrorInfo::BadRequest),
-            },
-            Self::ActiveTurnNotSteerable { turn_kind } => {
-                let turn_kind_label = match turn_kind {
-                    NonSteerableTurnKind::Review => "review",
-                    NonSteerableTurnKind::Compact => "compact",
-                };
-                ErrorEvent {
-                    message: format!("cannot steer a {turn_kind_label} turn"),
-                    codex_error_info: Some(CodexErrorInfo::ActiveTurnNotSteerable {
-                        turn_kind: *turn_kind,
-                    }),
-                }
-            }
-            Self::EmptyInput => ErrorEvent {
-                message: "input must not be empty".to_string(),
-                codex_error_info: Some(CodexErrorInfo::BadRequest),
-            },
-        }
-    }
-}
-
-/// Notes from the previous real user turn.
-///
-/// Conceptually this is the same role that `previous_model` used to fill, but
-/// it can carry other prior-turn settings that matter when constructing
-/// sensible state-change diffs or full-context reinjection, such as model
-/// switches or detecting a prior `realtime_active -> false` transition.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PreviousTurnSettings {
-    pub(crate) model: String,
-    pub(crate) realtime_active: Option<bool>,
-}
-
-use crate::SkillError;
-use crate::SkillLoadOutcome;
-use crate::SkillMetadata;
-use crate::SkillsManager;
-use crate::agents_md::AgentsMdManager;
-use crate::context::UserInstructions;
 use crate::exec_policy::ExecPolicyUpdateError;
 use crate::guardian::GuardianReviewSessionManager;
+use crate::mcp::McpEnvironmentScope;
 use crate::mcp::McpManager;
-use crate::memories;
+use crate::mcp::McpThreadIdentity;
 use crate::network_policy_decision::execpolicy_network_rule_amendment;
-use crate::plugins::PluginsManager;
-use crate::plugins::render_plugins_section;
-use crate::rollout::RolloutRecorder;
-use crate::rollout::RolloutRecorderParams;
 use crate::rollout::map_session_init_error;
-use crate::rollout::metadata;
-use crate::rollout::policy::EventPersistenceMode;
-use crate::session_startup_prewarm::SessionStartupPrewarmHandle;
+use crate::session::startup_prewarm::SessionStartupPrewarmHandle;
 use crate::shell;
-use crate::shell_snapshot::ShellSnapshot;
-use crate::skills_watcher::SkillsWatcher;
-use crate::skills_watcher::SkillsWatcherEvent;
-use crate::state::ActiveTurn;
-use crate::state::MailboxDeliveryPhase;
+use crate::state::AcceptedUserInputResponse;
+use crate::state::AutoCompactWindowIds;
+use crate::state::AutoCompactWindowSnapshot;
+use crate::state::PendingRequestPermissions;
+use crate::state::ReasoningEffortPin;
 use crate::state::SessionServices;
 use crate::state::SessionState;
+use crate::state::TaskKind;
 #[cfg(test)]
 use crate::stream_events_utils::HandleOutputCtx;
 #[cfg(test)]
 use crate::stream_events_utils::handle_output_item_done;
-use crate::tasks::GhostSnapshotTask;
 use crate::tasks::ReviewTask;
-use crate::tasks::SessionTask;
-use crate::tasks::SessionTaskContext;
-use crate::tools::js_repl::JsReplHandle;
-use crate::tools::js_repl::resolve_compatible_node;
+use crate::tools::ApprovalContext;
 use crate::tools::network_approval::NetworkApprovalService;
 use crate::tools::network_approval::build_blocked_request_observer;
 use crate::tools::network_approval::build_network_policy_decider;
 #[cfg(test)]
 use crate::tools::parallel::ToolCallRuntime;
+use crate::tools::sandboxing::ApprovalAction;
 use crate::tools::sandboxing::ApprovalStore;
 use crate::turn_timing::TurnTimingState;
 use crate::turn_timing::record_turn_ttfm_metric;
 use crate::unified_exec::UnifiedExecProcessManager;
 use crate::windows_sandbox::WindowsSandboxLevelExt;
+use crate::windows_sandbox::local_binding_policy_for_sandbox;
+use crate::windows_sandbox::managed_proxy_routing_for_windows_sandbox;
+use codex_core_plugins::PluginCommandAttribution;
+use codex_core_plugins::PluginsManager;
+use codex_core_plugins::RecommendedPluginCandidatesInput;
 use codex_git_utils::get_git_repo_root;
-use codex_mcp::compute_auth_statuses;
-use codex_mcp::with_codex_apps_mcp_with_authorization_header;
+use codex_history::CodexHarnessMetadata;
+use codex_history::CompactedItem;
+use codex_history::CompactionResumeMetadata;
+use codex_history::InitialHistory;
+pub(crate) use codex_history::PreviousTurnSettings;
+use codex_history::ResponseItemEnvelope;
+use codex_mcp::McpConfig;
+use codex_mcp::effective_mcp_servers;
 use codex_otel::SessionTelemetry;
 use codex_otel::THREAD_STARTED_METRIC;
 use codex_otel::TelemetryAuthMode;
+use codex_protocol::ResponseItemId;
+use codex_protocol::approvals::ExecApprovalKind;
 use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
-use codex_protocol::config_types::ServiceTier;
+use codex_protocol::config_types::Settings;
 use codex_protocol::config_types::WindowsSandboxLevel;
-use codex_protocol::models::ContentItem;
-use codex_protocol::models::DeveloperInstructions;
+use codex_protocol::mcp::ClientMcpExtensions;
+use codex_protocol::models::LocalImagePreparation;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
 use codex_protocol::protocol::AskForApproval;
-use codex_protocol::protocol::BackgroundEventEvent;
 use codex_protocol::protocol::CodexErrorInfo;
-use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::DeprecationNoticeEvent;
-use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecApprovalRequestEvent;
-use codex_protocol::protocol::InitialHistory;
-use codex_protocol::protocol::McpServerRefreshConfig;
 use codex_protocol::protocol::ModelRerouteEvent;
 use codex_protocol::protocol::ModelRerouteReason;
+use codex_protocol::protocol::ModelVerification;
+use codex_protocol::protocol::ModelVerificationEvent;
 use codex_protocol::protocol::NetworkApprovalContext;
-use codex_protocol::protocol::NonSteerableTurnKind;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RateLimitSnapshot;
+use codex_protocol::protocol::RawResponseCompletedEvent;
 use codex_protocol::protocol::RequestUserInputEvent;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionConfiguredEvent;
 use codex_protocol::protocol::SessionNetworkProxyRuntime;
-use codex_protocol::protocol::SkillDependencies as ProtocolSkillDependencies;
-use codex_protocol::protocol::SkillErrorInfo;
-use codex_protocol::protocol::SkillInterface as ProtocolSkillInterface;
-use codex_protocol::protocol::SkillMetadata as ProtocolSkillMetadata;
-use codex_protocol::protocol::SkillToolDependency as ProtocolSkillToolDependency;
 use codex_protocol::protocol::StreamErrorEvent;
-use codex_protocol::protocol::Submission;
+use codex_protocol::protocol::ThreadMemoryMode;
 use codex_protocol::protocol::TokenCountEvent;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
+use codex_protocol::protocol::TokenUsageRecord;
+use codex_protocol::protocol::TurnModerationMetadataEvent;
 use codex_protocol::protocol::WarningEvent;
+use codex_protocol::turn_input::TurnInputMode;
+use codex_protocol::turn_input::TurnInputRequest;
+use codex_protocol::turn_input::TurnInputSubmission;
+use codex_protocol::turn_input::TurnStartOptions;
 use codex_protocol::user_input::UserInput;
-use codex_tools::ToolsConfig;
-use codex_tools::ToolsConfigParams;
+use codex_skills_extension::HostSkillsService;
+use codex_tools::ToolName;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use codex_utils_readiness::Readiness;
-use codex_utils_readiness::ReadinessFlag;
 #[cfg(test)]
 use codex_utils_stream_parser::ProposedPlanSegment;
 
-/// The high-level interface to the Codex system.
-/// It operates as a queue pair where you send submissions and receive events.
-pub struct Codex {
+/// Queue and lifecycle endpoints for a running [`Session`].
+///
+/// Runtime state lives on `Session`; keeping these endpoints separate lets all
+/// submission senders be dropped to terminate the session loop. The shared
+/// completion future observes that shutdown.
+#[derive(Clone)]
+pub(crate) struct SessionIo {
     pub(crate) tx_sub: Sender<Submission>,
     pub(crate) rx_event: Receiver<Event>,
     // Last known status of the agent.
     pub(crate) agent_status: watch::Receiver<AgentStatus>,
-    pub(crate) session: Arc<Session>,
     // Shared future for the background submission loop completion so multiple
     // callers can wait for shutdown.
     pub(crate) session_loop_termination: SessionLoopTermination,
@@ -365,35 +424,92 @@ pub struct Codex {
 
 pub(crate) type SessionLoopTermination = Shared<BoxFuture<'static, ()>>;
 
-pub(crate) const THREAD_START_SKILLS_TRIMMED_WARNING_MESSAGE: &str = "Some enabled skills were not included in the model-visible skills list for this session. Mention a skill by name or path if you need it.";
-
-/// Wrapper returned by [`Codex::spawn`] containing the spawned [`Codex`] and
-/// the unique session id.
-pub struct CodexSpawnOk {
-    pub codex: Codex,
-    pub thread_id: ThreadId,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GitEnrichmentPolicy {
+    Fresh,
+    Skip,
 }
 
-pub(crate) struct CodexSpawnArgs {
+/// Controls which fork history belongs in the newly created thread's own rollout.
+pub(crate) enum ForkPersistence {
+    Copied,
+    /// The spawn caller owns the durability barrier before acknowledging the child.
+    CopiedDeferred,
+    Referenced {
+        history_base: Option<HistoryPosition>,
+        inherited_item_count: usize,
+    },
+}
+
+pub(crate) struct SessionSpawnArgs {
+    pub(crate) startup: Option<Arc<startup::SessionStartup>>,
     pub(crate) config: Config,
+    pub(crate) allow_provider_model_fallback: bool,
+    pub(crate) instructions: SessionInstructions,
+    pub(crate) installation_id: String,
     pub(crate) auth_manager: Arc<AuthManager>,
-    pub(crate) models_manager: Arc<ModelsManager>,
+    pub(crate) models_manager: SharedModelsManager,
+    pub(crate) git_root_discovery: Arc<GitRootDiscovery>,
     pub(crate) environment_manager: Arc<EnvironmentManager>,
-    pub(crate) skills_manager: Arc<SkillsManager>,
+    pub(crate) skills_service: Arc<HostSkillsService>,
     pub(crate) plugins_manager: Arc<PluginsManager>,
     pub(crate) mcp_manager: Arc<McpManager>,
-    pub(crate) skills_watcher: Arc<SkillsWatcher>,
+    pub(crate) code_mode_session_provider: Arc<dyn codex_code_mode::CodeModeSessionProvider>,
+    pub(crate) extensions: Arc<codex_extension_api::ExtensionRegistry<crate::config::Config>>,
     pub(crate) conversation_history: InitialHistory,
+    pub(crate) history_initialization: HistoryInitialization,
+    pub(crate) disabled_plugin_ids: Option<Vec<String>>,
+    pub(crate) requested_history_mode: Option<ThreadHistoryMode>,
+    pub(crate) fork_persistence: ForkPersistence,
     pub(crate) session_source: SessionSource,
-    pub(crate) agent_control: AgentControl,
+    pub(crate) forked_from_thread_id: Option<ThreadId>,
+    pub(crate) parent_thread_id: Option<ThreadId>,
+    pub(crate) thread_source: Option<ThreadSource>,
+    pub(crate) originator: String,
+    pub(crate) agent_control: AgentControlInit,
     pub(crate) dynamic_tools: Vec<DynamicToolSpec>,
-    pub(crate) persist_extended_history: bool,
     pub(crate) metrics_service_name: Option<String>,
-    pub(crate) inherited_shell_snapshot: Option<Arc<ShellSnapshot>>,
     pub(crate) inherited_exec_policy: Option<Arc<ExecPolicyManager>>,
+    pub(crate) inherited_environments: Option<TurnEnvironmentSnapshot>,
+    /// Parent rollout trace used only to derive fresh spawned child traces.
+    ///
+    /// Root sessions and non-thread-spawn subagents pass a disabled context;
+    /// `Session::new` creates the root trace itself when rollout tracing is enabled.
+    pub(crate) parent_rollout_thread_trace: ThreadTraceContext,
     pub(crate) user_shell_override: Option<shell::Shell>,
     pub(crate) parent_trace: Option<W3cTraceContext>,
+    pub(crate) environment_requests: Vec<TurnEnvironmentRequest>,
+    pub(crate) thread_extension_init: ExtensionDataInit,
+    pub(crate) turn_extension_init: ExtensionDataInit,
+    pub(crate) client_mcp_extensions: ClientMcpExtensions,
+    pub(crate) reserved_thread_id: Option<ThreadId>,
     pub(crate) analytics_events_client: Option<AnalyticsEventsClient>,
+    pub(crate) image_store: Arc<dyn AttachmentStore>,
+    pub(crate) thread_store: Arc<dyn ThreadStore>,
+    pub(crate) attestation_provider: Option<Arc<dyn AttestationProvider>>,
+    pub(crate) external_time_provider: Option<Arc<dyn TimeProvider>>,
+    pub(crate) inherited_multi_agent_version: Option<MultiAgentVersion>,
+    pub(crate) git_enrichment_policy: GitEnrichmentPolicy,
+    pub(crate) windows_sandbox_proxy_settings_mode:
+        codex_sandboxing::WindowsSandboxProxySettingsMode,
+}
+
+pub(crate) fn resolve_multi_agent_version(
+    conversation_history: &InitialHistory,
+    inherited_multi_agent_version: Option<MultiAgentVersion>,
+) -> Option<MultiAgentVersion> {
+    if inherited_multi_agent_version == Some(MultiAgentVersion::Disabled) {
+        return Some(MultiAgentVersion::Disabled);
+    }
+
+    conversation_history
+        .get_multi_agent_version()
+        .or(inherited_multi_agent_version)
+        .or(match conversation_history {
+            InitialHistory::New | InitialHistory::Cleared => None,
+            // Threads created before runtime metadata existed keep the legacy V1 tool surface.
+            InitialHistory::Resumed(_) | InitialHistory::Forked(_) => Some(MultiAgentVersion::V1),
+        })
 }
 
 pub(crate) const INITIAL_SUBMIT_ID: &str = "";
@@ -401,124 +517,164 @@ pub(crate) const SUBMISSION_CHANNEL_CAPACITY: usize = 512;
 const CYBER_VERIFY_URL: &str = "https://chatgpt.com/cyber";
 const CYBER_SAFETY_URL: &str = "https://developers.openai.com/codex/concepts/cyber-safety";
 
-impl Codex {
-    /// Spawn a new [`Codex`] and initialize the session.
-    pub(crate) async fn spawn(args: CodexSpawnArgs) -> CodexResult<CodexSpawnOk> {
-        let parent_trace = match args.parent_trace {
-            Some(trace) => {
-                if codex_otel::context_from_w3c_trace_context(&trace).is_some() {
-                    Some(trace)
-                } else {
-                    warn!("ignoring invalid thread spawn trace carrier");
-                    None
+impl Session {
+    /// Spawn and initialize a new session.
+    /// Hide the concrete startup future from callers while keeping initialization lazy.
+    #[inline(never)]
+    pub(crate) fn spawn(
+        args: SessionSpawnArgs,
+    ) -> BoxFuture<'static, CodexResult<(Arc<Self>, SessionIo)>> {
+        let tree_shutdown = args.agent_control.runtime().shutdown.clone();
+        Box::pin(async move {
+            let parent_trace = match args.parent_trace {
+                Some(trace) => {
+                    if codex_otel::context_from_w3c_trace_context(&trace).is_some() {
+                        Some(trace)
+                    } else {
+                        warn!("ignoring invalid thread spawn trace carrier");
+                        None
+                    }
                 }
+                None => None,
+            };
+            let thread_spawn_span = info_span!("thread_spawn", otel.name = "thread_spawn");
+            if let Some(trace) = parent_trace.as_ref() {
+                let _ = set_parent_from_w3c_trace_context(&thread_spawn_span, trace);
             }
-            None => None,
-        };
-        let thread_spawn_span = info_span!("thread_spawn", otel.name = "thread_spawn");
-        if let Some(trace) = parent_trace.as_ref() {
-            let _ = set_parent_from_w3c_trace_context(&thread_spawn_span, trace);
-        }
-        Self::spawn_internal(CodexSpawnArgs {
-            parent_trace,
-            ..args
+            let spawn = Self::spawn_internal(SessionSpawnArgs {
+                parent_trace,
+                ..args
+            })
+            .instrument(thread_spawn_span);
+            tokio::select! {
+                biased;
+                _ = tree_shutdown.cancelled() => Err(CodexErr::TurnAborted),
+                result = spawn => result,
+            }
         })
-        .instrument(thread_spawn_span)
-        .await
     }
 
-    async fn spawn_internal(args: CodexSpawnArgs) -> CodexResult<CodexSpawnOk> {
-        let CodexSpawnArgs {
-            mut config,
+    async fn spawn_internal(args: SessionSpawnArgs) -> CodexResult<(Arc<Self>, SessionIo)> {
+        args.config.validate_windows_mxc_requirement()?;
+        let SessionSpawnArgs {
+            startup,
+            config,
+            allow_provider_model_fallback,
+            instructions,
+            installation_id,
             auth_manager,
             models_manager,
+            git_root_discovery,
             environment_manager,
-            skills_manager,
+            skills_service,
             plugins_manager,
             mcp_manager,
-            skills_watcher,
+            code_mode_session_provider,
+            extensions,
             conversation_history,
+            history_initialization,
+            disabled_plugin_ids,
+            requested_history_mode,
+            fork_persistence,
             session_source,
+            forked_from_thread_id,
+            parent_thread_id,
+            thread_source,
+            originator,
             agent_control,
             dynamic_tools,
-            persist_extended_history,
             metrics_service_name,
-            inherited_shell_snapshot,
             user_shell_override,
             inherited_exec_policy,
+            inherited_environments,
+            parent_rollout_thread_trace,
             parent_trace: _,
+            environment_requests,
+            mut thread_extension_init,
+            turn_extension_init,
+            client_mcp_extensions,
+            reserved_thread_id,
             analytics_events_client,
+            image_store,
+            thread_store,
+            attestation_provider,
+            external_time_provider,
+            inherited_multi_agent_version,
+            git_enrichment_policy,
+            windows_sandbox_proxy_settings_mode,
         } = args;
         let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
         let (tx_event, rx_event) = async_channel::unbounded();
 
-        let environment = environment_manager
-            .current()
-            .await
-            .map_err(|err| CodexErr::Fatal(format!("failed to create environment: {err}")))?;
-        let fs = environment
-            .as_ref()
-            .map(|environment| environment.get_filesystem());
-        let plugin_outcome = plugins_manager.plugins_for_config(&config).await;
-        let effective_skill_roots = plugin_outcome.effective_skill_roots();
-        let skills_input = skills_load_input_from_config(&config, effective_skill_roots);
-        let loaded_skills = skills_manager.skills_for_config(&skills_input, fs).await;
-
-        for err in &loaded_skills.errors {
-            error!(
-                "failed to load skill {}: {}",
-                err.path.display(),
-                err.message
-            );
-        }
-
-        if let SessionSource::SubAgent(SubAgentSource::ThreadSpawn { depth, .. }) = session_source
-            && depth >= config.agent_max_depth
-        {
-            let _ = config.features.disable(Feature::SpawnCsv);
-            let _ = config.features.disable(Feature::Collab);
-        }
-
-        if config.features.enabled(Feature::JsRepl)
-            && let Err(err) = resolve_compatible_node(config.js_repl_node_path.as_deref()).await
-        {
-            let _ = config.features.disable(Feature::JsRepl);
-            let _ = config.features.disable(Feature::JsReplToolsOnly);
-            let message = if config.features.enabled(Feature::JsRepl) {
-                format!(
-                    "`js_repl` remains enabled because enterprise requirements pin it on, but the configured Node runtime is unavailable or incompatible. {err}"
-                )
-            } else {
-                format!(
-                    "Disabled `js_repl` for this session because the configured Node runtime is unavailable or incompatible. {err}"
-                )
+        let isolation = thread_extension_init
+            .get::<codex_extension_api::SessionIsolation>()
+            .map(|policy| *policy)
+            .unwrap_or_default();
+        // Manager-owned threads and inline delegates bind roots at the same startup boundary.
+        let selected_capability_roots =
+            match thread_extension_init.get::<Vec<SelectedCapabilityRoot>>() {
+                Some(roots) => roots.as_ref().clone(),
+                None => {
+                    // Resume restores this thread's saved roots, including roots for environments
+                    // it will select again later. New children inherit roots regardless of copied history.
+                    let roots = if !matches!(&conversation_history, InitialHistory::Resumed(_))
+                        && isolation == codex_extension_api::SessionIsolation::Inherit
+                        && let Some(environments) = &inherited_environments
+                    {
+                        environments.selected_capability_roots()
+                    } else {
+                        conversation_history.get_selected_capability_roots()
+                    };
+                    if !roots.is_empty() {
+                        thread_extension_init.insert(roots.clone());
+                    }
+                    roots
+                }
             };
-            warn!("{message}");
-            config.startup_warnings.push(message);
-        }
-        if config.features.enabled(Feature::CodeMode)
-            && let Err(err) = resolve_compatible_node(config.js_repl_node_path.as_deref()).await
-        {
-            let message = format!(
-                "Disabled `exec` for this session because the configured Node runtime is unavailable or incompatible. {err}"
-            );
-            warn!("{message}");
-            let _ = config.features.disable(Feature::CodeMode);
-            config.startup_warnings.push(message);
-        }
-
-        let user_instructions = AgentsMdManager::new(&config)
-            .user_instructions(environment.as_deref())
-            .await;
-
-        let exec_policy = if crate::guardian::is_guardian_reviewer_source(&session_source) {
-            // Guardian review should rely on the built-in shell safety checks,
-            // not on caller-provided exec-policy rules that could shape the
-            // reviewer or silently auto-approve commands.
-            Arc::new(ExecPolicyManager::default())
+        let environment_selections = environment_requests
+            .into_iter()
+            .map(|request| TurnEnvironmentSelection::new(request, &selected_capability_roots))
+            .collect::<Vec<_>>();
+        // Enforce snapshot-only instructions for both managed and inline isolated sessions.
+        let instructions = if isolation == codex_extension_api::SessionIsolation::Isolated {
+            SessionInstructions {
+                user: instructions.user,
+                thread: instructions.thread,
+                project_snapshot: instructions.project_snapshot,
+                ..Default::default()
+            }
+        } else {
+            instructions
+        };
+        let exec_policy = if isolation == codex_extension_api::SessionIsolation::Isolated {
+            let managed_policy = config
+                .config_layer_stack
+                .requirements()
+                .exec_policy
+                .as_deref()
+                .map_or_else(codex_execpolicy::Policy::empty, |policy| {
+                    policy.as_ref().clone()
+                });
+            Arc::new(ExecPolicyManager::new(Arc::new(managed_policy)))
         } else if let Some(exec_policy) = &inherited_exec_policy {
             Arc::clone(exec_policy)
         } else {
+            if !config
+                .config_layer_stack
+                .ignore_user_and_project_exec_policy_rules()
+            {
+                let codex_home = config.codex_home.clone();
+                let policy_path = default_policy_path(codex_home.as_path());
+                if let Err(err) = prefix_rule_migration(
+                    codex_home.as_path(),
+                    policy_path.as_path(),
+                    BANNED_PREFIX_SUGGESTIONS,
+                )
+                .await
+                {
+                    tracing::warn!(error = %err, "failed to run prefix rule migration");
+                }
+            }
             Arc::new(
                 ExecPolicyManager::load(&config.config_layer_stack)
                     .await
@@ -526,10 +682,11 @@ impl Codex {
             )
         };
 
-        let config = Arc::new(config);
-        let refresh_strategy = match session_source {
-            SessionSource::SubAgent(_) => codex_models_manager::manager::RefreshStrategy::Offline,
-            _ => codex_models_manager::manager::RefreshStrategy::OnlineIfUncached,
+        let mut config = Arc::new(config);
+        let refresh_strategy = if session_source.is_non_root_agent() {
+            codex_models_manager::manager::RefreshStrategy::Offline
+        } else {
+            codex_models_manager::manager::RefreshStrategy::OnlineIfUncached
         };
         if config.model.is_none()
             || !matches!(
@@ -537,162 +694,359 @@ impl Codex {
                 codex_models_manager::manager::RefreshStrategy::Offline
             )
         {
-            let _ = models_manager.list_models(refresh_strategy).await;
+            let _ = models_manager
+                .list_models(refresh_strategy, config.http_client_factory())
+                .await;
         }
         let model = models_manager
-            .get_default_model(&config.model, refresh_strategy)
+            .get_default_model(
+                &config.model,
+                allow_provider_model_fallback,
+                refresh_strategy,
+                config.http_client_factory(),
+            )
             .await;
+        if model.trim().is_empty() {
+            return Err(CodexErr::InvalidRequest(
+                "No models are available. Set `model` explicitly or check your model catalog configuration.".to_string(),
+            ));
+        }
+        let trusted_guardian_reviewer = crate::guardian::is_basic_session_source(&session_source)
+            && !matches!(conversation_history, InitialHistory::Resumed(_));
+        if config
+            .config_layer_stack
+            .requirements()
+            .auto_review_required_for_model(&model)
+            && !trusted_guardian_reviewer
+        {
+            let config = Arc::make_mut(&mut config);
+            if matches!(
+                config.legacy_sandbox_policy(),
+                SandboxPolicy::DangerFullAccess
+            ) {
+                let permission_profile = PermissionProfile::workspace_write();
+                config
+                    .permissions
+                    .set_permission_profile(permission_profile.clone())
+                    .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?;
+                if let Some(network) = config.permissions.network.as_ref() {
+                    config.permissions.network = Some(
+                        network
+                            .recompute_for_permission_profile(&permission_profile)
+                            .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?,
+                    );
+                }
+            }
+            config
+                .config_layer_stack
+                .requirements()
+                .approvals_reviewer
+                .can_set(&ApprovalsReviewer::AutoReview)
+                .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?;
+            config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+        }
+        if allow_provider_model_fallback
+            && let Some(requested_model) = config.model.as_ref()
+            && model != *requested_model
+        {
+            info!(
+                model_provider = %config.model_provider_id,
+                requested_model,
+                fallback_model = %model,
+                "replaced unavailable requested model with provider default"
+            );
+        }
 
         // Resolve base instructions for the session. Priority order:
         // 1. config.base_instructions override
         // 2. conversation history => session_meta.base_instructions
-        // 3. base_instructions for current model
+        // 3. rendered instructions_template for current model
         let model_info = models_manager
             .get_model_info(model.as_str(), &config.to_models_manager_config())
             .await;
+        let auth = auth_manager.auth_cached();
+        // Forked subagents keep their parent's activation with the copied history.
+        // Fresh children restore configured preferences before applying startup defaults.
+        let inherits_token_budget = matches!(&conversation_history, InitialHistory::Forked(_))
+            && config.token_budget_startup_config.is_some();
+        if !inherits_token_budget {
+            Arc::make_mut(&mut config)
+                .prepare_token_budget_for_startup()
+                .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?;
+            // Resolve activation for this runtime, including when resuming saved history.
+            token_budget::apply_experimental_context(
+                Arc::make_mut(&mut config),
+                auth.as_ref(),
+                &model_info,
+            )?;
+            token_budget::apply_model_defaults(Arc::make_mut(&mut config), &model_info);
+        }
+        let configured_config = Arc::clone(&config);
+        let multi_agent_version = config.multi_agent_version_override().or_else(|| {
+            resolve_multi_agent_version(&conversation_history, inherited_multi_agent_version)
+        });
+        let history_mode = conversation_history.get_history_mode(
+            requested_history_mode.unwrap_or_else(|| thread_store.default_history_mode()),
+        );
         let base_instructions = config
             .base_instructions
             .clone()
             .or_else(|| conversation_history.get_base_instructions().map(|s| s.text))
-            .unwrap_or_else(|| model_info.get_model_instructions(config.personality));
+            .unwrap_or_else(|| render_model_instructions(&model_info));
 
-        // Respect thread-start tools. When missing (resumed/forked threads), read from the db
-        // first, then fall back to rollout-file tools.
-        let persisted_tools = if dynamic_tools.is_empty() {
-            let thread_id = match &conversation_history {
-                InitialHistory::Resumed(resumed) => Some(resumed.conversation_id),
-                InitialHistory::Forked(_) => conversation_history.forked_from_id(),
-                InitialHistory::New | InitialHistory::Cleared => None,
-            };
-            match thread_id {
-                Some(thread_id) => {
-                    let state_db_ctx = state_db::get_state_db(&config).await;
-                    state_db::get_dynamic_tools(state_db_ctx.as_deref(), thread_id, "codex_spawn")
-                        .await
-                }
-                None => None,
-            }
-        } else {
-            None
-        };
+        // Dynamic tools are defined at thread start and persisted in rollout session metadata.
         let dynamic_tools = if dynamic_tools.is_empty() {
-            persisted_tools
-                .or_else(|| conversation_history.get_dynamic_tools())
-                .unwrap_or_default()
+            conversation_history.get_dynamic_tools().unwrap_or_default()
         } else {
             dynamic_tools
         };
-
+        let disabled_plugin_ids = disabled_plugin_ids.unwrap_or_else(|| {
+            let settings_owner = match &conversation_history {
+                InitialHistory::Resumed(resumed) => Some(resumed.conversation_id),
+                InitialHistory::Forked(_) => forked_from_thread_id,
+                InitialHistory::New | InitialHistory::Cleared => None,
+            };
+            settings_owner
+                .and_then(|thread_id| {
+                    codex_history::latest_disabled_plugin_ids(
+                        conversation_history.get_rollout_items(),
+                        thread_id,
+                    )
+                })
+                .map(<[String]>::to_vec)
+                .unwrap_or_default()
+        });
         // TODO (aibrahim): Consolidate config.model and config.model_reasoning_effort into config.collaboration_mode
         // to avoid extracting these fields separately and constructing CollaborationMode here.
+        let persisted_collaboration_mode = match &conversation_history {
+            InitialHistory::Resumed(resumed) => resumed
+                .history
+                .iter()
+                .rev()
+                .find_map(|item| match item {
+                    RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event))
+                        if event.thread_id == Some(resumed.conversation_id) =>
+                    {
+                        Some(&event.thread_settings.collaboration_mode)
+                    }
+                    _ => None,
+                })
+                .or_else(|| {
+                    resumed
+                        .history
+                        .iter()
+                        .rev()
+                        .find_map(|item| match item {
+                            RolloutItem::TurnContext(context) => {
+                                Some(context.collaboration_mode.as_ref())
+                            }
+                            _ => None,
+                        })
+                        .flatten()
+                }),
+            InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_) => None,
+        };
         let collaboration_mode = CollaborationMode {
             mode: ModeKind::Default,
             settings: Settings {
                 model: model.clone(),
-                reasoning_effort: config.model_reasoning_effort,
+                reasoning_effort: config.model_reasoning_effort.clone(),
                 developer_instructions: None,
             },
         };
+        let collaboration_mode = persisted_collaboration_mode.map_or(collaboration_mode, |saved| {
+            saved.with_updates(
+                Some(model.clone()),
+                Some(config.model_reasoning_effort.clone()),
+                /*developer_instructions*/ None,
+            )
+        });
+        let initial_service_tier_warning = unsupported_service_tier_warning(
+            config.service_tier.as_deref(),
+            &config.features,
+            &model_info,
+        );
+        let service_tier =
+            get_service_tier(config.service_tier.clone(), &config.features, &model_info);
+        let storage_originator = AuthStorageOriginator::from_client_name(&originator);
         let session_configuration = SessionConfiguration {
-            provider: config.model_provider.clone(),
-            collaboration_mode,
-            model_reasoning_summary: config.model_reasoning_summary,
-            service_tier: config.service_tier,
+            turn_extension_init,
+            provider: create_model_provider(
+                config.model_provider.clone(),
+                Some(Arc::clone(&auth_manager)),
+            ),
+            step_settings: Arc::new(StepSettings {
+                collaboration_mode,
+                reasoning_summary: config.model_reasoning_summary,
+                service_tier,
+                personality: config.personality,
+                approval_policy: config.permissions.approval_policy.clone(),
+                approvals_reviewer: config.approvals_reviewer,
+            }),
+            environments: environment_selections.clone(),
+            model_info_overrides: config.to_models_manager_config().into(),
             developer_instructions: config.developer_instructions.clone(),
-            user_instructions,
-            personality: config.personality,
             base_instructions,
-            compact_prompt: config.compact_prompt.clone(),
-            approval_policy: config.permissions.approval_policy.clone(),
-            approvals_reviewer: config.approvals_reviewer,
-            sandbox_policy: config.permissions.sandbox_policy.clone(),
-            file_system_sandbox_policy: config.permissions.file_system_sandbox_policy.clone(),
-            network_sandbox_policy: config.permissions.network_sandbox_policy,
+            permission_profile_state: session_permission_profile_state_from_config(&config)?,
+            allow_login_shell: config.permissions.allow_login_shell,
+            shell_environment_policy: config.permissions.shell_environment_policy.clone(),
             windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
-            cwd: config.cwd.clone(),
+            windows_sandbox_type: config.effective_local_windows_sandbox_type(),
+            use_legacy_landlock: config.features.use_legacy_landlock(),
+            legacy_fallback_cwd: config.cwd.clone(),
+            runtime_workspace_roots: config.workspace_roots.clone(),
             codex_home: config.codex_home.clone(),
             thread_name: None,
+            disabled_plugin_ids,
             original_config_do_not_use: Arc::clone(&config),
             metrics_service_name,
             app_server_client_name: None,
             app_server_client_version: None,
+            trusted_guardian_reviewer,
             session_source,
+            history_mode,
+            forked_from_thread_id,
+            parent_thread_id,
+            thread_source,
+            originator,
             dynamic_tools,
-            persist_extended_history,
-            inherited_shell_snapshot,
             user_shell_override,
         };
+        session_configuration
+            .validate(&environment_selections)
+            .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?;
+        crate::windows_sandbox::log_windows_sandbox_startup(&config);
 
-        // Generate a unique ID for the lifetime of this Codex session.
+        // Generate a unique ID for the lifetime of this session.
         let session_source_clone = session_configuration.session_source.clone();
         let (agent_status_tx, agent_status_rx) = watch::channel(AgentStatus::PendingInit);
 
-        let session = Session::new(
+        let session = Box::pin(Session::new(
+            startup.clone(),
             session_configuration,
+            &environment_selections,
             config.clone(),
+            instructions,
+            installation_id,
             auth_manager.clone(),
             models_manager.clone(),
+            git_root_discovery,
+            model_info,
             exec_policy,
             tx_event.clone(),
             agent_status_tx.clone(),
             conversation_history,
+            history_initialization,
+            fork_persistence,
             session_source_clone,
-            skills_manager,
+            skills_service,
             plugins_manager,
             mcp_manager.clone(),
-            skills_watcher,
+            code_mode_session_provider,
+            extensions,
+            thread_extension_init,
+            client_mcp_extensions,
             agent_control,
-            environment,
+            reserved_thread_id,
+            environment_manager,
+            inherited_environments,
             analytics_events_client,
-        )
+            image_store,
+            thread_store,
+            parent_rollout_thread_trace,
+            attestation_provider,
+            external_time_provider,
+            multi_agent_version,
+            git_enrichment_policy,
+            windows_sandbox_proxy_settings_mode,
+        ))
         .await
         .map_err(|e| {
             error!("Failed to create session: {e:#}");
-            map_session_init_error(&e, &config.codex_home)
+            match e.downcast::<CodexErr>() {
+                Ok(error) => error,
+                Err(error) => map_session_init_error(&error, &config.codex_home),
+            }
         })?;
-        let thread_id = session.conversation_id;
+        if let Some(message) = initial_service_tier_warning {
+            session
+                .send_event_raw(Event {
+                    id: INITIAL_SUBMIT_ID.to_owned(),
+                    msg: EventMsg::Warning(WarningEvent { message }),
+                })
+                .await;
+        }
+        let thread_id = session.thread_id;
 
         // This task will run until Op::Shutdown is received.
+        let tree_teardown = startup
+            .as_ref()
+            .and_then(|startup| startup.session_teardown(thread_id));
         let session_for_loop = Arc::clone(&session);
-        let session_loop_handle = tokio::spawn(async move {
-            submission_loop(session_for_loop, config, rx_sub)
+        let session_loop_handle = tokio::spawn(Box::pin(storage_originator.scope(async move {
+            submission_loop(session_for_loop, configured_config, rx_sub)
                 .instrument(info_span!("session_loop", thread_id = %thread_id))
                 .await;
-        });
-        let codex = Codex {
+            if let Some(tree_teardown) = tree_teardown {
+                tree_teardown.complete();
+            }
+        })));
+        let io = SessionIo {
             tx_sub,
             rx_event,
             agent_status: agent_status_rx,
-            session,
             session_loop_termination: session_loop_termination_from_handle(session_loop_handle),
         };
 
-        Ok(CodexSpawnOk { codex, thread_id })
+        if let Some(startup) = startup {
+            let _ = startup.io.set(io.clone());
+            startup.persistence.lock().await.commit();
+        }
+        Ok((session, io))
     }
+}
 
+impl SessionIo {
     /// Submit the `op` wrapped in a `Submission` with a unique ID.
-    pub async fn submit(&self, op: Op) -> CodexResult<String> {
-        self.submit_with_trace(op, /*trace*/ None).await
+    pub(crate) async fn submit(
+        &self,
+        op: impl Into<WithTurnExtensionData<Op>>,
+    ) -> CodexResult<String> {
+        self.submit_with_trace(
+            op, /*trace*/ None, /*parent_turn_id*/ None, /*root_turn_id*/ None,
+            /*residency_guard*/ None,
+        )
+        .await
     }
 
-    pub async fn submit_with_trace(
+    pub(crate) async fn submit_with_trace(
         &self,
-        op: Op,
+        op: impl Into<WithTurnExtensionData<Op>>,
         trace: Option<W3cTraceContext>,
+        parent_turn_id: Option<String>,
+        root_turn_id: Option<String>,
+        residency_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
     ) -> CodexResult<String> {
-        let id = Uuid::now_v7().to_string();
+        let id = new_submission_id();
+        let WithTurnExtensionData {
+            request: op,
+            turn_extension_init,
+        } = op.into();
         let sub = Submission {
             id: id.clone(),
             op,
+            turn_extension_init,
             trace,
+            parent_turn_id,
+            root_turn_id,
+            residency_guard,
         };
         self.submit_with_id(sub).await?;
         Ok(id)
     }
 
-    /// Use sparingly: prefer `submit()` so Codex is responsible for generating
-    /// unique IDs for each submission.
-    pub async fn submit_with_id(&self, mut sub: Submission) -> CodexResult<()> {
+    /// Use sparingly: prefer `submit()` so submission IDs are generated consistently.
+    pub(crate) async fn submit_with_id(&self, mut sub: Submission) -> CodexResult<()> {
         if sub.trace.is_none() {
             sub.trace = current_span_w3c_trace_context();
         }
@@ -703,29 +1057,77 @@ impl Codex {
         Ok(())
     }
 
-    /// Persist a thread-level memory mode update for the active session.
+    /// Submits an ordered turn-input call and waits only for Core's routing decision.
     ///
-    /// This is a local-only operation that updates rollout metadata directly
-    /// and does not involve the model.
-    pub async fn set_thread_memory_mode(
+    /// Once queued, dropping the waiter does not retract the call. If the
+    /// session loop exits before replying, the caller gets `InternalAgentDied`.
+    pub(crate) async fn submit_turn_input(
         &self,
-        mode: codex_protocol::protocol::ThreadMemoryMode,
-    ) -> anyhow::Result<()> {
-        handlers::persist_thread_memory_mode_update(&self.session, mode).await
+        request: impl Into<WithTurnExtensionData<TurnInputRequest>>,
+        mode: TurnInputMode,
+    ) -> CodexResult<TurnInputSubmission> {
+        let id = new_submission_id();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let WithTurnExtensionData {
+            mut request,
+            turn_extension_init,
+        } = request.into();
+        let trace = request.trace.take();
+        self.submit_with_id(Submission {
+            id,
+            op: Op::TurnInput {
+                request: Box::new(request),
+                mode,
+                reply: reply_tx,
+            },
+            trace,
+            turn_extension_init,
+            parent_turn_id: None,
+            root_turn_id: None,
+            residency_guard: None,
+        })
+        .await?;
+        reply_rx.await.unwrap_or(Err(CodexErr::InternalAgentDied))
     }
 
-    pub async fn shutdown_and_wait(&self) -> CodexResult<()> {
+    pub(crate) async fn submit_recover_turn(
+        &self,
+        thread_settings: ThreadSettingsOverrides,
+        start_options: TurnStartOptions,
+        trace: Option<W3cTraceContext>,
+        turn_id: String,
+        turn_extension_init: Option<ExtensionDataInit>,
+    ) -> CodexResult<TurnInputSubmission> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.submit_with_id(Submission {
+            id: turn_id,
+            op: Op::RecoverTurn {
+                thread_settings,
+                start_options,
+                reply: reply_tx,
+            },
+            trace,
+            turn_extension_init,
+            parent_turn_id: None,
+            root_turn_id: None,
+            residency_guard: None,
+        })
+        .await?;
+        reply_rx.await.unwrap_or(Err(CodexErr::InternalAgentDied))
+    }
+
+    pub(crate) async fn shutdown_and_wait(&self) -> CodexResult<()> {
         let session_loop_termination = self.session_loop_termination.clone();
         match self.submit(Op::Shutdown).await {
             Ok(_) => {}
-            Err(CodexErr::InternalAgentDied) => {}
+            Err(err) if matches!(err.details(), CodexErrorDetails::InternalAgentDied) => {}
             Err(err) => return Err(err),
         }
         session_loop_termination.await;
         Ok(())
     }
 
-    pub async fn next_event(&self) -> CodexResult<Event> {
+    pub(crate) async fn next_event(&self) -> CodexResult<Event> {
         let event = self
             .rx_event
             .recv()
@@ -734,47 +1136,58 @@ impl Codex {
         Ok(event)
     }
 
-    pub async fn steer_input(
-        &self,
-        input: Vec<UserInput>,
-        expected_turn_id: Option<&str>,
-        responsesapi_client_metadata: Option<HashMap<String, String>>,
-    ) -> Result<String, SteerInputError> {
-        self.session
-            .steer_input(input, expected_turn_id, responsesapi_client_metadata)
-            .await
-    }
-
-    pub(crate) async fn set_app_server_client_info(
-        &self,
-        app_server_client_name: Option<String>,
-        app_server_client_version: Option<String>,
-    ) -> ConstraintResult<()> {
-        self.session
-            .update_settings(SessionSettingsUpdate {
-                app_server_client_name,
-                app_server_client_version,
-                ..Default::default()
-            })
-            .await
-    }
-
     pub(crate) async fn agent_status(&self) -> AgentStatus {
         self.agent_status.borrow().clone()
     }
+}
 
-    pub(crate) async fn thread_config_snapshot(&self) -> ThreadConfigSnapshot {
-        let state = self.session.state.lock().await;
-        state.session_configuration.thread_config_snapshot()
-    }
+/// Generate a core submission ID. App-server exposes submission IDs that
+/// create turns as a public-facing turn ID.
+///
+/// Some use cases take advantage of the fact that these are UUID7 which
+/// encodes a timestamp, so think carefully before changing this.
+pub(crate) fn new_submission_id() -> String {
+    Uuid::now_v7().to_string()
+}
 
-    pub(crate) fn state_db(&self) -> Option<state_db::StateDbHandle> {
-        self.session.state_db()
+pub(crate) fn get_service_tier(
+    configured_service_tier: Option<String>,
+    features: &Features,
+    model_info: &ModelInfo,
+) -> Option<String> {
+    let service_tier = configured_service_tier?;
+    if service_tier == ServiceTier::Flex.request_value() {
+        return Some(service_tier);
     }
+    if features.service_tier_enabled(&service_tier)
+        && (service_tier == SERVICE_TIER_DEFAULT_REQUEST_VALUE
+            || model_info.supports_service_tier(&service_tier))
+    {
+        return Some(service_tier);
+    }
+    None
+}
 
-    pub(crate) fn enabled(&self, feature: Feature) -> bool {
-        self.session.enabled(feature)
-    }
+fn unsupported_service_tier_warning(
+    configured_service_tier: Option<&str>,
+    features: &Features,
+    model_info: &ModelInfo,
+) -> Option<String> {
+    let service_tier = configured_service_tier.filter(|service_tier| {
+        features.service_tier_enabled(service_tier)
+            && *service_tier != SERVICE_TIER_DEFAULT_REQUEST_VALUE
+            && !model_info.supports_service_tier(service_tier)
+    })?;
+    Some(format!(
+        "Configured service tier `{service_tier}` is not advertised as supported for model `{}` and will be omitted from requests.",
+        model_info.slug
+    ))
+}
+
+fn session_permission_profile_state_from_config(
+    config: &Config,
+) -> CodexResult<PermissionProfileState> {
+    Ok(config.permissions.permission_profile_state().clone())
 }
 
 #[cfg(test)]
@@ -792,24 +1205,33 @@ pub(crate) fn session_loop_termination_from_handle(
     .shared()
 }
 
-async fn thread_title_from_state_db(
-    state_db: Option<&state_db::StateDbHandle>,
-    codex_home: &AbsolutePathBuf,
+async fn thread_title_from_thread_store(
+    live_thread: Option<&LiveThread>,
+    thread_store: &Arc<dyn ThreadStore>,
     conversation_id: ThreadId,
 ) -> Option<String> {
-    if let Some(metadata) = state_db
-        && let Some(metadata) = metadata.get_thread(conversation_id).await.ok().flatten()
-    {
-        let title = metadata.title.trim();
-        if !title.is_empty() && metadata.first_user_message.as_deref().map(str::trim) != Some(title)
-        {
-            return Some(title.to_string());
+    let thread = match live_thread {
+        Some(live_thread) => {
+            live_thread
+                .read_thread(
+                    /*include_archived*/ true, /*include_history*/ false,
+                )
+                .await
+        }
+        None => {
+            thread_store
+                .read_thread(ReadThreadParams {
+                    thread_id: conversation_id,
+                    include_archived: true,
+                    include_history: false,
+                })
+                .await
         }
     }
-    find_thread_name_by_id(codex_home, &conversation_id)
-        .await
-        .ok()
-        .flatten()
+    .ok()?;
+
+    let title = thread.name.as_deref()?.trim();
+    (!title.is_empty() && thread.preview.trim() != title).then(|| title.to_string())
 }
 
 impl Session {
@@ -824,41 +1246,38 @@ impl Session {
         }
     }
 
-    fn managed_network_proxy_active_for_sandbox_policy(sandbox_policy: &SandboxPolicy) -> bool {
-        !matches!(sandbox_policy, SandboxPolicy::DangerFullAccess)
+    fn managed_network_proxy_active_for_permission_profile(
+        permission_profile: &PermissionProfile,
+    ) -> bool {
+        !matches!(permission_profile, PermissionProfile::Disabled)
     }
 
     /// Builds the `x-codex-beta-features` header value for this session.
     ///
     /// `ModelClient` is session-scoped and intentionally does not depend on the full `Config`, so
     /// we precompute the comma-separated list of enabled experimental feature keys at session
-    /// creation time and thread it into the client.
+    /// creation time and thread it into the client. Remote compaction stays advertised unconditionally.
     fn build_model_client_beta_features_header(config: &Config) -> Option<String> {
-        let beta_features_header = FEATURES
-            .iter()
-            .filter_map(|spec| {
-                if spec.stage.experimental_menu_description().is_some()
-                    && config.features.enabled(spec.id)
-                {
-                    Some(spec.key)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-
-        if beta_features_header.is_empty() {
-            None
-        } else {
-            Some(beta_features_header)
-        }
+        Some(
+            FEATURES
+                .iter()
+                .filter(|spec| {
+                    spec.id == Feature::RemoteCompactionV2
+                        || (spec.stage.experimental_menu_description().is_some()
+                            && config.features.enabled(spec.id))
+                })
+                .map(|spec| spec.key)
+                .collect::<Vec<_>>()
+                .join(","),
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn start_managed_network_proxy(
         spec: &crate::config::NetworkProxySpec,
         exec_policy: &codex_execpolicy::Policy,
-        sandbox_policy: &SandboxPolicy,
+        permission_profile: &PermissionProfile,
+        windows_sandbox_type: SandboxType,
         network_policy_decider: Option<Arc<dyn codex_network_proxy::NetworkPolicyDecider>>,
         blocked_request_observer: Option<Arc<dyn codex_network_proxy::BlockedRequestObserver>>,
         managed_network_requirements_enabled: bool,
@@ -875,7 +1294,9 @@ impl Session {
             .unwrap_or_else(|_| spec.clone());
         let network_proxy = spec
             .start_proxy(
-                sandbox_policy,
+                permission_profile,
+                managed_proxy_routing_for_windows_sandbox(windows_sandbox_type),
+                local_binding_policy_for_sandbox(windows_sandbox_type, Some(std::env::consts::OS)),
                 network_policy_decider,
                 blocked_request_observer,
                 managed_network_requirements_enabled,
@@ -893,10 +1314,7 @@ impl Session {
         Ok((network_proxy, session_network_proxy))
     }
 
-    async fn refresh_managed_network_proxy_for_current_sandbox_policy(&self) {
-        let Some(started_proxy) = self.services.network_proxy.as_ref() else {
-            return;
-        };
+    async fn refresh_managed_network_proxy_for_current_permission_profile(&self) {
         let Ok(_refresh_guard) = self.managed_network_proxy_refresh_lock.acquire().await else {
             error!("managed network proxy refresh semaphore closed");
             return;
@@ -910,12 +1328,17 @@ impl Session {
             .permissions
             .network
             .as_ref()
+            .cloned()
         else {
+            self.services.network_proxy.store(None);
+            self.services
+                .turn_environments
+                .set_snapshot_credential_broker(SnapshotCredentialBrokerState::Inactive);
             return;
         };
 
         let spec = match spec
-            .recompute_for_sandbox_policy(session_configuration.sandbox_policy.get())
+            .recompute_for_permission_profile(&session_configuration.permission_profile())
         {
             Ok(spec) => spec,
             Err(err) => {
@@ -933,97 +1356,93 @@ impl Session {
                 spec
             }
         };
-        if let Err(err) = spec.apply_to_started_proxy(started_proxy).await {
-            warn!("failed to refresh managed network proxy for sandbox change: {err}");
+        // Disabled specs still carry managed requirements and constraints, but they do not have
+        // listeners and must not be exposed as active managed proxy runtimes.
+        if !spec.enabled() {
+            self.services.network_proxy.store(None);
+            self.services
+                .turn_environments
+                .set_snapshot_credential_broker(SnapshotCredentialBrokerState::Inactive);
+            return;
+        }
+        let managed_proxy_routing =
+            managed_proxy_routing_for_windows_sandbox(session_configuration.windows_sandbox_type);
+        let started_proxy = self.services.network_proxy.load_full();
+        let network_policy_decider = started_proxy
+            .as_ref()
+            .and_then(|started_proxy| started_proxy.network_policy_decider());
+        if let Some(started_proxy) = started_proxy
+            && started_proxy.proxy().managed_proxy_routing() == managed_proxy_routing
+        {
+            if let Err(err) = spec.apply_to_started_proxy(started_proxy.as_ref()).await {
+                warn!("failed to refresh managed network proxy for sandbox change: {err}");
+            } else {
+                self.services
+                    .turn_environments
+                    .set_snapshot_credential_broker(if spec.credential_broker_enabled() {
+                        SnapshotCredentialBrokerState::Ready(started_proxy.proxy())
+                    } else {
+                        SnapshotCredentialBrokerState::Inactive
+                    });
+            }
+            return;
+        }
+
+        match Self::start_managed_network_proxy(
+            &spec,
+            current_exec_policy.as_ref(),
+            &session_configuration.permission_profile(),
+            session_configuration.windows_sandbox_type,
+            network_policy_decider,
+            Some(build_blocked_request_observer(Arc::clone(
+                &self.services.network_approval,
+            ))),
+            self.services.managed_network_requirements_configured,
+            self.services.network_proxy_audit_metadata.clone(),
+        )
+        .await
+        {
+            Ok((started_proxy, _session_network_proxy)) => {
+                if spec.credential_broker_enabled() {
+                    self.services
+                        .turn_environments
+                        .set_snapshot_credential_broker(SnapshotCredentialBrokerState::Ready(
+                            started_proxy.proxy(),
+                        ));
+                }
+                self.services
+                    .network_proxy
+                    .store(Some(Arc::new(started_proxy)));
+            }
+            Err(err) => {
+                self.services
+                    .turn_environments
+                    .set_snapshot_credential_broker(if spec.credential_broker_enabled() {
+                        SnapshotCredentialBrokerState::Unavailable
+                    } else {
+                        SnapshotCredentialBrokerState::Inactive
+                    });
+                warn!("failed to start managed network proxy for sandbox change: {err}");
+            }
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn codex_home(&self) -> AbsolutePathBuf {
         let state = self.state.lock().await;
         state.session_configuration.codex_home().clone()
     }
 
-    pub(crate) fn subscribe_out_of_band_elicitation_pause_state(&self) -> watch::Receiver<bool> {
-        self.out_of_band_elicitation_paused.subscribe()
+    pub(crate) fn subscribe_elicitation_pause_state(&self) -> watch::Receiver<bool> {
+        self.services.elicitations.subscribe()
     }
 
-    pub(crate) fn set_out_of_band_elicitation_pause_state(&self, paused: bool) {
-        self.out_of_band_elicitation_paused.send_replace(paused);
+    pub(crate) fn mark_interrupted(&self) {
+        self.agent_status.send_replace(AgentStatus::Interrupted);
     }
 
-    fn start_skills_watcher_listener(self: &Arc<Self>) {
-        let mut rx = self.services.skills_watcher.subscribe();
-        let weak_sess = Arc::downgrade(self);
-        tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(SkillsWatcherEvent::SkillsChanged { .. }) => {
-                        let Some(sess) = weak_sess.upgrade() else {
-                            break;
-                        };
-                        let event = Event {
-                            id: sess.next_internal_sub_id(),
-                            msg: EventMsg::SkillsUpdateAvailable,
-                        };
-                        sess.send_event_raw(event).await;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                }
-            }
-        });
-    }
-
-    fn start_agent_identity_registration(self: &Arc<Self>) {
-        if !self.services.agent_identity_manager.is_enabled() {
-            return;
-        }
-
-        let weak_sess = Arc::downgrade(self);
-        let mut auth_state_rx = self.services.auth_manager.subscribe_auth_state();
-        tokio::spawn(async move {
-            loop {
-                let Some(sess) = weak_sess.upgrade() else {
-                    return;
-                };
-                match sess
-                    .services
-                    .agent_identity_manager
-                    .ensure_registered_identity()
-                    .await
-                {
-                    Ok(Some(_)) => {
-                        sess.maybe_prewarm_agent_task_registration().await;
-                        return;
-                    }
-                    Ok(None) => {
-                        drop(sess);
-                        if auth_state_rx.changed().await.is_err() {
-                            return;
-                        }
-                    }
-                    Err(error) => {
-                        sess.fail_agent_identity_registration(error).await;
-                        return;
-                    }
-                }
-            }
-        });
-    }
-
-    async fn fail_agent_identity_registration(self: &Arc<Self>, error: anyhow::Error) {
-        warn!(error = %error, "agent identity registration failed");
-        let message = format!(
-            "Agent identity registration failed while `features.use_agent_identity` is enabled: {error}"
-        );
-        self.send_event_raw(Event {
-            id: self.next_internal_sub_id(),
-            msg: EventMsg::Error(ErrorEvent {
-                message,
-                codex_error_info: Some(CodexErrorInfo::Other),
-            }),
-        })
-        .await;
+    pub(crate) fn is_interrupted(&self) -> bool {
+        matches!(*self.agent_status.borrow(), AgentStatus::Interrupted)
     }
 
     pub(crate) fn get_tx_event(&self) -> Sender<Event> {
@@ -1034,33 +1453,51 @@ impl Session {
         self.services.state_db.clone()
     }
 
+    pub(crate) fn live_thread_for_persistence(
+        &self,
+        operation: &str,
+    ) -> anyhow::Result<&LiveThread> {
+        self.live_thread()
+            .ok_or_else(|| anyhow::anyhow!("Session persistence is disabled; cannot {operation}."))
+    }
+
+    pub(crate) fn live_thread(&self) -> Option<&LiveThread> {
+        self.services.live_thread.as_ref()
+    }
+
+    pub(crate) async fn set_thread_memory_mode(
+        self: &Arc<Self>,
+        mode: ThreadMemoryMode,
+    ) -> anyhow::Result<()> {
+        handlers::persist_thread_memory_mode_update(self, mode).await
+    }
+
     /// Flush rollout writes and return the final durability-barrier result.
+    #[instrument(name = "session.flush_rollout", level = "trace", skip_all)]
     pub(crate) async fn flush_rollout(&self) -> std::io::Result<()> {
-        let recorder = {
-            let guard = self.services.rollout.lock().await;
-            guard.clone()
-        };
-        if let Some(recorder) = recorder {
-            recorder.flush().await
+        if let Some(live_thread) = self.live_thread() {
+            live_thread.flush().await.map_err(std::io::Error::other)
         } else {
             Ok(())
         }
     }
 
-    pub(crate) async fn try_ensure_rollout_materialized(&self) -> std::io::Result<()> {
-        let recorder = {
-            let guard = self.services.rollout.lock().await;
-            guard.clone()
-        };
-        if let Some(rec) = recorder {
-            rec.persist().await?;
+    pub(crate) async fn try_ensure_rollout_materialized(
+        &self,
+        context: PersistContext,
+    ) -> std::io::Result<()> {
+        if let Some(live_thread) = self.live_thread() {
+            live_thread
+                .persist(context)
+                .await
+                .map_err(std::io::Error::other)?;
         }
         Ok(())
     }
 
-    pub(crate) async fn ensure_rollout_materialized(&self) {
-        if let Err(e) = self.try_ensure_rollout_materialized().await {
-            warn!("failed to materialize rollout recorder: {e}");
+    pub(crate) async fn ensure_rollout_materialized(&self, context: PersistContext) {
+        if let Err(e) = self.try_ensure_rollout_materialized(context).await {
+            warn!("failed to materialize thread persistence: {e}");
         }
     }
 
@@ -1071,31 +1508,21 @@ impl Session {
         format!("auto-compact-{id}")
     }
 
-    pub(crate) async fn route_realtime_text_input(self: &Arc<Self>, text: String) {
-        handlers::user_input_or_turn_inner(
-            self,
-            self.next_internal_sub_id(),
-            Op::UserInput {
-                items: vec![UserInput::Text {
-                    text,
-                    text_elements: Vec::new(),
-                }],
-                final_output_json_schema: None,
-                responsesapi_client_metadata: None,
-            },
-            /*mirror_user_text_to_realtime*/ None,
-        )
-        .await;
-    }
-
     pub(crate) async fn get_total_token_usage(&self) -> i64 {
         let state = self.state.lock().await;
         state.get_total_token_usage(state.server_reasoning_included())
     }
 
-    pub(crate) async fn get_total_token_usage_breakdown(&self) -> TotalTokenUsageBreakdown {
+    pub(crate) async fn auto_compact_window_snapshot(&self) -> AutoCompactWindowSnapshot {
         let state = self.state.lock().await;
-        state.history.get_total_token_usage_breakdown()
+        state.auto_compact_window_snapshot()
+    }
+
+    pub(crate) async fn estimated_tokens_after_last_model_generated_item(&self) -> i64 {
+        let state = self.state.lock().await;
+        state
+            .history
+            .estimated_tokens_after_last_model_generated_item()
     }
 
     pub(crate) async fn total_token_usage(&self) -> Option<TokenUsage> {
@@ -1118,18 +1545,44 @@ impl Session {
         &self,
         turn_context: &TurnContext,
     ) -> Option<i64> {
-        let state = self.state.lock().await;
-        state.history.estimate_token_count(turn_context)
+        let history = self.clone_history().await;
+        history.estimate_token_count(turn_context)
     }
 
     pub(crate) async fn get_base_instructions(&self) -> BaseInstructions {
         let state = self.state.lock().await;
         BaseInstructions {
             text: state.session_configuration.base_instructions.clone(),
+            provenance: state.base_instructions_provenance.clone(),
+        }
+    }
+
+    /// Render the request copy without changing instructions persisted or inherited by forks.
+    pub(crate) async fn get_prompt_base_instructions(&self) -> BaseInstructions {
+        let config = self.get_config().await;
+        let instructions = self.get_base_instructions().await;
+        if !config.update_plan_enabled
+            && config.model_catalog.is_none()
+            && matches!(
+                instructions.provenance,
+                Some(BaseInstructionsProvenance::Model { .. })
+            )
+        {
+            BaseInstructions {
+                text: codex_prompts::without_update_plan_instructions(&instructions.text),
+                ..instructions
+            }
+        } else {
+            instructions
         }
     }
 
     // Merges connector IDs into the session-level explicit connector selection.
+    #[tracing::instrument(
+        level = "trace",
+        skip_all,
+        fields(connector_count = connector_ids.len())
+    )]
     pub(crate) async fn merge_connector_selection(
         &self,
         connector_ids: HashSet<String>,
@@ -1151,12 +1604,18 @@ impl Session {
     }
 
     async fn record_initial_history(&self, conversation_history: InitialHistory) {
-        let turn_context = self.new_default_turn().await;
-        let is_subagent = {
+        let (is_subagent, is_paginated_subagent) = {
             let state = self.state.lock().await;
-            matches!(
-                state.session_configuration.session_source,
-                SessionSource::SubAgent(_)
+            let session_configuration = &state.session_configuration;
+            (
+                session_configuration.session_source.is_non_root_agent(),
+                matches!(
+                    session_configuration.history_mode,
+                    ThreadHistoryMode::Paginated
+                ) && matches!(
+                    session_configuration.thread_source.as_ref(),
+                    Some(ThreadSource::Subagent | ThreadSource::GuardianReview)
+                ),
             )
         };
         let has_prior_user_turns = initial_history_has_prior_user_turns(&conversation_history);
@@ -1164,22 +1623,32 @@ impl Session {
             let mut state = self.state.lock().await;
             state.set_next_turn_is_first(!has_prior_user_turns);
         }
-        match conversation_history {
+        let turn_context = match conversation_history {
             InitialHistory::New | InitialHistory::Cleared => {
                 // Defer initial context insertion until the first real turn starts so
                 // turn/start overrides can be merged before we write model-visible context.
                 self.set_previous_turn_settings(/*previous_turn_settings*/ None)
                     .await;
+                None
             }
             InitialHistory::Resumed(resumed_history) => {
+                let turn_context = self.new_default_turn().await;
                 let rollout_items = resumed_history.history;
-                self.restore_persisted_agent_task(&rollout_items).await;
+                if matches!(
+                    rollout_items.iter().rev().find_map(|item| match item {
+                        RolloutItem::EventMsg(event) => agent_status_from_event(event),
+                        _ => None,
+                    }),
+                    Some(AgentStatus::Interrupted)
+                ) {
+                    self.agent_status.send_replace(AgentStatus::Interrupted);
+                }
                 let previous_turn_settings = self
                     .apply_rollout_reconstruction(&turn_context, &rollout_items)
                     .await;
 
                 // If resuming, warn when the last recorded model differs from the current one.
-                let curr: &str = turn_context.model_info.slug.as_str();
+                let curr: &str = turn_context.model_info().slug.as_str();
                 if let Some(prev) = previous_turn_settings
                     .as_ref()
                     .map(|settings| settings.model.as_str())
@@ -1204,14 +1673,25 @@ impl Session {
                     let mut state = self.state.lock().await;
                     state.set_token_info(Some(info));
                 }
+                self.state.lock().await.latest_token_usage_record =
+                    Self::last_token_usage_record_from_rollout(&rollout_items);
+
+                // Checkpoint effective settings even when no turn follows the resume.
+                self.persist_rollout_items(&[RolloutItem::EventMsg(
+                    thread_settings::applied_event(self).await,
+                )])
+                .await;
 
                 // Defer seeding the session's initial context until the first turn starts so
-                // turn/start overrides can be merged before we write to the rollout.
+                // turn/start overrides can be merged before we write model-visible context.
                 if !is_subagent {
                     let _ = self.flush_rollout().await;
                 }
+                None
             }
-            InitialHistory::Forked(rollout_items) => {
+            InitialHistory::Forked(mut rollout_items) => {
+                let turn_context = self.new_default_turn().await;
+                Self::assign_missing_rollout_response_item_ids(&mut rollout_items);
                 self.apply_rollout_reconstruction(&turn_context, &rollout_items)
                     .await;
 
@@ -1221,40 +1701,191 @@ impl Session {
                     let mut state = self.state.lock().await;
                     state.set_token_info(Some(info));
                 }
+                self.state.lock().await.latest_token_usage_record =
+                    Self::last_token_usage_record_from_rollout(&rollout_items);
 
-                // If persisting, persist all rollout items as-is (recorder filters)
-                if !rollout_items.is_empty() {
-                    self.persist_rollout_items(&rollout_items).await;
+                let thread_settings_applied =
+                    RolloutItem::EventMsg(thread_settings::applied_event(self).await);
+                match &self.fork_persistence {
+                    ForkPersistence::Referenced {
+                        inherited_item_count,
+                        ..
+                    } => {
+                        // Ancestor records remain behind history_base; only effective child
+                        // settings and boundaries synthesized by snapshot processing are local.
+                        rollout_items.drain(..*inherited_item_count);
+                        rollout_items.insert(0, thread_settings_applied);
+                    }
+                    ForkPersistence::Copied | ForkPersistence::CopiedDeferred
+                        if is_paginated_subagent =>
+                    {
+                        // Paginated subagents already persist inherited context when their live
+                        // thread is created.
+                        rollout_items.clear();
+                        rollout_items.push(thread_settings_applied);
+                    }
+                    ForkPersistence::Copied | ForkPersistence::CopiedDeferred => {
+                        // Keep the copied prefix and effective child settings in one append so a
+                        // cold resume cannot observe inherited settings as the latest value.
+                        rollout_items.push(thread_settings_applied);
+                    }
                 }
+                self.persist_rollout_items(&rollout_items).await;
 
-                // Forked threads should remain file-backed immediately after startup.
-                self.ensure_rollout_materialized().await;
+                // Agent spawn owns its final durability barrier so it can overlap the edge write.
+                let persist_context = match self.fork_persistence {
+                    ForkPersistence::CopiedDeferred => PersistContext::SubagentSpawn,
+                    ForkPersistence::Copied | ForkPersistence::Referenced { .. } => {
+                        PersistContext::Standard
+                    }
+                };
+                self.ensure_rollout_materialized(persist_context).await;
 
                 // Flush after seeding history and any persisted rollout copy.
                 if !is_subagent {
                     let _ = self.flush_rollout().await;
                 }
+                Some(turn_context)
+            }
+        };
+        if let Some(turn_context) = turn_context
+            && turn_context.config.memories.disable_on_external_context
+        {
+            let history = self.clone_history().await;
+            if let Some(item) = history
+                .raw_items()
+                .find(|item| matches!(item, ResponseItem::FunctionCallOutput { call_id: None, .. }))
+            {
+                mark_thread_memory_mode_polluted_if_external_context(self, &turn_context, item)
+                    .await;
             }
         }
     }
 
+    #[instrument(
+        level = "trace",
+        skip_all,
+        fields(
+            thread_id = %self.thread_id(),
+            rollout_item_count = rollout_items.len()
+        )
+    )]
     async fn apply_rollout_reconstruction(
         &self,
-        turn_context: &TurnContext,
+        turn_context: &Arc<TurnContext>,
         rollout_items: &[RolloutItem],
     ) -> Option<PreviousTurnSettings> {
-        let reconstructed_rollout = self
+        let rollout_reconstruction::RolloutReconstruction {
+            mut history,
+            retained_context,
+            guardian_history,
+            last_started_turn_id,
+            previous_turn_settings,
+            reference_context_item,
+            turn_attribution,
+            world_state_baseline,
+            window_number,
+            first_window_id,
+            previous_window_id,
+            window_id,
+        } = self
             .reconstruct_history_from_rollout(turn_context, rollout_items)
             .await;
-        let previous_turn_settings = reconstructed_rollout.previous_turn_settings.clone();
-        self.replace_history(
-            reconstructed_rollout.history,
-            reconstructed_rollout.reference_context_item,
-        )
+        // Keep the recorded rollout unchanged. Prepare its reconstructed history before
+        // installing it, so legacy media is processed once for this resume or fork and
+        // will be processed again if the rollout is reconstructed in a future session.
+        // Replay disables image-resize notices, so media preparation remains one-to-one. Keep
+        // the prior batch behavior and carry history-only metadata in a positional sidecar.
+        let (mut prepared_history, metadata): (Vec<_>, Vec<_>) = history
+            .into_iter()
+            .map(|envelope| (envelope.item, envelope.metadata))
+            .unzip();
+        // Replay must not upload or migrate recorded history. The inline store returns prepared
+        // inline bytes, while existing file references bypass preparation and remain unchanged.
+        // Bound replay future size now that image preparation can await storage.
+        let _ = Box::pin(prepare_image_response_items(
+            &self.thread_id.to_string(),
+            turn_context.config.ephemeral,
+            &mut prepared_history,
+            ImagePreparationMode::DetailBased,
+            ImageResizeNoticeMode::Disabled,
+            &InlineAttachmentStore,
+        ))
         .await;
-        self.set_previous_turn_settings(previous_turn_settings.clone())
-            .await;
+        prepare_audio_response_items(&mut prepared_history);
+        assert_eq!(
+            prepared_history.len(),
+            metadata.len(),
+            "replay media preparation must remain one-to-one when resize notices are disabled"
+        );
+        history = prepared_history
+            .into_iter()
+            .zip(metadata)
+            .map(|(item, metadata)| ResponseItemEnvelope { item, metadata })
+            .collect();
+        let context = crate::guardian::GuardianReviewContext::from(turn_context);
+        let (_, reviewer) = crate::guardian::resolve_review_model(self, &context).await;
+        let reviewer_compaction_hash = reviewer.comp_hash.clone();
+        {
+            let mut state = self.state.lock().await;
+            state.replace_annotated_history(
+                history,
+                reference_context_item,
+                HistoryReplacement::Reset,
+            );
+            state.history.restore_review_context(
+                Some(&retained_context),
+                guardian_history.as_ref(),
+                reviewer_compaction_hash.as_deref(),
+            );
+            state.last_started_turn_id = last_started_turn_id;
+            state.turn_attribution = turn_attribution;
+            if let Some(world_state) = world_state_baseline {
+                state.history.set_world_state_baseline(world_state);
+            }
+            let fallback_ids = state.auto_compact_window_ids();
+            let window_id = window_id.unwrap_or(fallback_ids.window_id);
+            state.restore_auto_compact_window(
+                window_number,
+                AutoCompactWindowIds {
+                    first_window_id: first_window_id.unwrap_or(window_id),
+                    previous_window_id,
+                    window_id,
+                },
+            );
+            state.set_previous_turn_settings(previous_turn_settings.clone());
+        }
+        let prefix_tokens = if matches!(
+            turn_context.config.model_auto_compact_token_limit_scope,
+            AutoCompactTokenLimitScope::BodyAfterPrefix
+        ) {
+            let history = self.clone_history().await;
+            let base_instructions = self.get_base_instructions().await;
+            history.estimate_token_count_with_base_instructions(&base_instructions)
+        } else {
+            None
+        };
+        if let Some(prefix_tokens) = prefix_tokens {
+            self.set_auto_compact_window_estimated_prefill_for_scope(turn_context, prefix_tokens)
+                .await;
+        }
         previous_turn_settings
+    }
+
+    async fn set_auto_compact_window_estimated_prefill_for_scope(
+        &self,
+        turn_context: &TurnContext,
+        tokens: i64,
+    ) {
+        if !matches!(
+            turn_context.config.model_auto_compact_token_limit_scope,
+            AutoCompactTokenLimitScope::BodyAfterPrefix
+        ) {
+            return;
+        }
+
+        let mut state = self.state.lock().await;
+        state.set_auto_compact_window_estimated_prefill(tokens);
     }
 
     fn last_token_info_from_rollout(rollout_items: &[RolloutItem]) -> Option<TokenUsageInfo> {
@@ -1264,11 +1895,27 @@ impl Session {
         })
     }
 
+    fn last_token_usage_record_from_rollout(
+        rollout_items: &[RolloutItem],
+    ) -> Option<TokenUsageRecord> {
+        for item in rollout_items.iter().rev() {
+            match item {
+                RolloutItem::TokenUsageRecord(record) => return Some(record.clone()),
+                RolloutItem::Compacted(compacted) => {
+                    return compacted.latest_token_usage_record.clone();
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
     async fn previous_turn_settings(&self) -> Option<PreviousTurnSettings> {
         let state = self.state.lock().await;
         state.previous_turn_settings()
     }
 
+    #[tracing::instrument(level = "trace", skip_all)]
     pub(crate) async fn set_previous_turn_settings(
         &self,
         previous_turn_settings: Option<PreviousTurnSettings>,
@@ -1277,45 +1924,41 @@ impl Session {
         state.set_previous_turn_settings(previous_turn_settings);
     }
 
-    fn maybe_refresh_shell_snapshot_for_cwd(
-        &self,
-        previous_cwd: &AbsolutePathBuf,
-        next_cwd: &AbsolutePathBuf,
-        codex_home: &AbsolutePathBuf,
-        session_source: &SessionSource,
-    ) {
-        if previous_cwd == next_cwd {
-            return;
-        }
-
-        if !self.features.enabled(Feature::ShellSnapshot) {
-            return;
-        }
-
-        if matches!(
-            session_source,
-            SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
-        ) {
-            return;
-        }
-
-        ShellSnapshot::refresh_snapshot(
-            codex_home.clone(),
-            self.conversation_id,
-            next_cwd.clone(),
-            self.services.user_shell.as_ref().clone(),
-            self.services.shell_snapshot_tx.clone(),
-            self.services.session_telemetry.clone(),
-        );
-    }
-
     pub(crate) async fn update_settings(
         &self,
         updates: SessionSettingsUpdate,
-    ) -> ConstraintResult<()> {
-        let (previous_cwd, sandbox_policy_changed, next_cwd, codex_home, session_source) = {
+    ) -> ConstraintResult<SessionSettingsCommit> {
+        let Some(commit) = self.update_settings_if(updates, |_, _| true).await? else {
+            unreachable!("unconditional settings updates must commit");
+        };
+        Ok(commit)
+    }
+
+    /// Evaluates the caller's synchronous predicate against the current configuration
+    /// and validated candidate under the same state lock used for publication.
+    /// This prevents a stale admission decision. Rejection has no settings or runtime
+    /// effects.
+    ///
+    /// The predicate must be fast and side-effect-free. It must not block, acquire
+    /// other locks, or call back into `Session`.
+    async fn update_settings_if(
+        &self,
+        updates: SessionSettingsUpdate,
+        should_commit: impl FnOnce(&SessionConfiguration, &SessionConfiguration) -> bool + Send,
+    ) -> ConstraintResult<Option<SessionSettingsCommit>> {
+        let notify_config_contributors = !self.services.extensions.config_contributors().is_empty();
+        let windows_sandbox_changed;
+        let (
+            commit,
+            previous_config,
+            new_config,
+            permission_profile_changed,
+            mcp_inputs_changed,
+            credential_masking_warning,
+        ) = {
             let mut state = self.state.lock().await;
-            let updated = match state.session_configuration.apply(&updates) {
+            let updated = match self.apply_session_settings(&state.session_configuration, &updates)
+            {
                 Ok(updated) => updated,
                 Err(err) => {
                     warn!("rejected session settings update: {err}");
@@ -1323,36 +1966,158 @@ impl Session {
                 }
             };
 
-            let previous_cwd = state.session_configuration.cwd.clone();
-            let sandbox_policy_changed =
-                state.session_configuration.sandbox_policy != updated.sandbox_policy;
-            let next_cwd = updated.cwd.clone();
-            let codex_home = updated.codex_home.clone();
-            let session_source = updated.session_source.clone();
+            if !should_commit(&state.session_configuration, &updated) {
+                return Ok(None);
+            }
+
+            let credential_masking_warning = updated
+                .original_config_do_not_use
+                .credential_masking_warning(&updated.permission_profile())
+                .filter(|warning| {
+                    Some(*warning)
+                        != state
+                            .session_configuration
+                            .original_config_do_not_use
+                            .credential_masking_warning(
+                                &state.session_configuration.permission_profile(),
+                            )
+                });
+            let previous_config = notify_config_contributors
+                .then(|| self.build_effective_session_config(&state.session_configuration));
+            let previous_permission_profile = state.session_configuration.permission_profile();
+            let updated_permission_profile = updated.permission_profile();
+            let permission_profile_changed =
+                previous_permission_profile != updated_permission_profile;
+            let root_service_tier_changed = updated.parent_thread_id.is_none()
+                && state.session_configuration.step_settings.service_tier
+                    != updated.step_settings.service_tier;
+            let mcp_inputs_changed = self.mcp_inputs_differ(&state.session_configuration, &updated);
+            if mcp_inputs_changed {
+                self.mark_mcp_runtime_dirty();
+            }
+            // Save new environment defaults for future turns. The running turn keeps its own.
+            windows_sandbox_changed =
+                state.session_configuration.windows_sandbox_level != updated.windows_sandbox_level;
             state.session_configuration = updated;
+            if root_service_tier_changed {
+                self.services.agent_control.propagate_config_update(
+                    AgentConfigUpdate::ServiceTier(
+                        state
+                            .session_configuration
+                            .step_settings
+                            .service_tier
+                            .clone(),
+                    ),
+                );
+            }
+            let new_config = notify_config_contributors
+                .then(|| self.build_effective_session_config(&state.session_configuration));
+            let commit = SessionSettingsCommit {
+                configuration: state.session_configuration.clone(),
+                snapshot: state
+                    .session_configuration
+                    .thread_settings_snapshot(&state.session_configuration.environments),
+            };
             (
-                previous_cwd,
-                sandbox_policy_changed,
-                next_cwd,
-                codex_home,
-                session_source,
+                commit,
+                previous_config,
+                new_config,
+                permission_profile_changed,
+                mcp_inputs_changed,
+                credential_masking_warning,
             )
         };
-
-        self.maybe_refresh_shell_snapshot_for_cwd(
-            &previous_cwd,
-            &next_cwd,
-            &codex_home,
-            &session_source,
-        );
-        if sandbox_policy_changed {
-            self.refresh_managed_network_proxy_for_current_sandbox_policy()
+        if windows_sandbox_changed {
+            crate::windows_sandbox::log_windows_sandbox_change(
+                commit.configuration.codex_home.as_path(),
+                commit.configuration.windows_sandbox_type,
+                commit.configuration.windows_sandbox_level,
+            );
+        }
+        self.emit_config_changed_contributors(previous_config.as_ref(), new_config.as_ref());
+        if permission_profile_changed {
+            self.refresh_managed_network_proxy_for_current_permission_profile()
                 .await;
         }
+        if let Some(message) = credential_masking_warning {
+            warn!("{message}");
+            self.send_event_raw(Event {
+                id: INITIAL_SUBMIT_ID.to_owned(),
+                msg: EventMsg::Warning(WarningEvent {
+                    message: message.to_string(),
+                }),
+            })
+            .await;
+        }
+        if mcp_inputs_changed {
+            self.schedule_mcp_prewarm();
+        }
+        Ok(Some(commit))
+    }
 
+    pub(crate) async fn preview_settings(
+        &self,
+        updates: &SessionSettingsUpdate,
+    ) -> ConstraintResult<ThreadConfigSnapshot> {
+        let state = self.state.lock().await;
+        let configuration = self.apply_session_settings(&state.session_configuration, updates)?;
+        Ok(configuration.thread_config_snapshot(configuration.environments.clone()))
+    }
+
+    pub(crate) async fn thread_config_snapshot(&self) -> ThreadConfigSnapshot {
+        let state = self.state.lock().await;
+        state
+            .session_configuration
+            .thread_config_snapshot(state.session_configuration.environments.clone())
+    }
+
+    pub(crate) async fn configured_environment_selections(&self) -> Vec<TurnEnvironmentSelection> {
+        let state = self.state.lock().await;
+        state.session_configuration.environments.clone()
+    }
+
+    pub(crate) async fn thread_settings_snapshot(&self) -> ThreadSettingsSnapshot {
+        let state = self.state.lock().await;
+        state
+            .session_configuration
+            .thread_settings_snapshot(&state.session_configuration.environments)
+    }
+
+    pub(crate) async fn restorable_thread_settings(&self) -> CodexThreadSettingsOverrides {
+        let state = self.state.lock().await;
+        state
+            .session_configuration
+            .restorable_thread_settings(state.session_configuration.environments.clone())
+    }
+
+    pub(crate) async fn set_app_server_client_info(
+        &self,
+        app_server_client_name: Option<String>,
+        app_server_client_version: Option<String>,
+        mcp_elicitations_auto_deny: bool,
+    ) -> ConstraintResult<()> {
+        self.update_settings(SessionSettingsUpdate {
+            app_server_client_name,
+            app_server_client_version,
+            ..Default::default()
+        })
+        .await?;
+        self.services
+            .mcp_runtime
+            .set_elicitations_auto_deny(mcp_elicitations_auto_deny);
         Ok(())
     }
 
+    pub(crate) async fn instruction_sources(&self) -> Vec<PathUri> {
+        self.services
+            .agents_md_manager
+            .get_loaded()
+            .await
+            .as_ref()
+            .map_or_else(Vec::new, |instructions| instructions.sources().collect())
+    }
+
+    #[cfg(test)]
     pub(crate) async fn set_session_startup_prewarm(
         &self,
         startup_prewarm: SessionStartupPrewarmHandle,
@@ -1366,6 +2131,53 @@ impl Session {
         state.take_session_startup_prewarm()
     }
 
+    pub(crate) async fn fork_config(
+        &self,
+    ) -> (
+        Config,
+        ThreadConfigSnapshot,
+        WindowsSandboxLevel,
+        TurnEnvironmentSnapshot,
+        ReasoningEffortPin,
+    ) {
+        let (configuration, environments, mut reasoning_effort_pin) = {
+            let state = self.state.lock().await;
+            (
+                state.session_configuration.clone(),
+                self.services.turn_environments.snapshot_now(),
+                state.reasoning_effort_pin.clone(),
+            )
+        };
+        let config = self.build_effective_session_config(&configuration);
+        if !config.features.enabled(Feature::ReasoningEffortOverride) {
+            let model = configuration
+                .step_settings
+                .resolve_model_info(
+                    self.services.models_manager.as_ref(),
+                    &configuration.model_info_overrides,
+                )
+                .await;
+            if let Some(effort) = config
+                .model_reasoning_effort
+                .clone()
+                .or_else(|| model.default_reasoning_level.clone())
+            {
+                // Without overrides, the parent's selected effort is its request baseline.
+                reasoning_effort_pin = ReasoningEffortPin::Active {
+                    model: model.slug.clone(),
+                    effort: model.resolve_reasoning_effort(effort),
+                };
+            }
+        }
+        (
+            config,
+            configuration.thread_config_snapshot(environments.all_selections()),
+            configuration.windows_sandbox_level,
+            environments,
+            reasoning_effort_pin,
+        )
+    }
+
     pub(crate) async fn get_config(&self) -> std::sync::Arc<Config> {
         let state = self.state.lock().await;
         state
@@ -1374,79 +2186,258 @@ impl Session {
             .clone()
     }
 
+    pub(crate) async fn inherited_instructions(&self) -> SessionInstructions {
+        self.services
+            .agents_md_manager
+            .inherited_instructions()
+            .await
+    }
+
+    pub(crate) async fn emit_instruction_warnings(&self, warnings: Vec<String>) {
+        for message in warnings {
+            self.send_event_raw(Event {
+                id: INITIAL_SUBMIT_ID.to_owned(),
+                msg: EventMsg::Warning(WarningEvent { message }),
+            })
+            .await;
+        }
+    }
+
     pub(crate) async fn provider(&self) -> ModelProviderInfo {
         let state = self.state.lock().await;
-        state.session_configuration.provider.clone()
+        state.session_configuration.provider.info().clone()
+    }
+
+    pub(crate) async fn refresh_hooks(&self, mut config: Arc<Config>) {
+        loop {
+            let disabled_plugin_ids = self.state.lock().await.active_disabled_plugin_ids.clone();
+            let environments = self.services.turn_environments.snapshot().await;
+            let hooks_config = build_hooks_config(
+                config.as_ref(),
+                self.services.plugins_manager.as_ref(),
+                environments.single_local_environment(),
+                &disabled_plugin_ids,
+            )
+            .await;
+
+            let state = self.state.lock().await;
+            if Arc::ptr_eq(
+                &state.session_configuration.original_config_do_not_use,
+                &config,
+            ) && state.active_disabled_plugin_ids == disabled_plugin_ids
+            {
+                let hooks = self.hooks().reconfigured(hooks_config);
+                self.services.hooks.store(Arc::new(hooks));
+                return;
+            }
+            // Unrelated updates can replace the owner too. Rebuild current inputs
+            // so they cannot strand a pending plugin-policy refresh.
+            config = Arc::clone(&state.session_configuration.original_config_do_not_use);
+        }
+    }
+
+    fn emit_config_changed_contributors(
+        &self,
+        previous_config: Option<&Config>,
+        new_config: Option<&Config>,
+    ) {
+        let (Some(previous_config), Some(new_config)) = (previous_config, new_config) else {
+            return;
+        };
+        if previous_config == new_config {
+            return;
+        }
+        for contributor in self.services.extensions.config_contributors() {
+            contributor.on_config_changed(
+                &self.services.session_extension_data,
+                &self.services.thread_extension_data,
+                previous_config,
+                new_config,
+            );
+        }
     }
 
     pub(crate) async fn reload_user_config_layer(&self) {
-        let config_toml_path = {
-            let state = self.state.lock().await;
-            state
-                .session_configuration
-                .codex_home
-                .join(CONFIG_TOML_FILE)
-        };
+        // Refresh layer-backed runtime state for an existing session, including enabled plugin,
+        // skill, hook, and MCP feature state. Other feature gates and legacy notify settings
+        // remain session-static.
+        //
+        // Prefer `refresh_runtime_config()` when the host can already provide a materialized
+        // config snapshot. This file-based path exists for legacy local reload flows.
+        // Retry from the current owner if another publication wins while files are read.
+        loop {
+            let (expected_config, config_toml_paths) = {
+                let state = self.state.lock().await;
+                let config = Arc::clone(&state.session_configuration.original_config_do_not_use);
+                let user_config_paths = config
+                    .config_layer_stack
+                    .all_layers_low_to_high()
+                    .filter_map(|layer| match &layer.name {
+                        ConfigLayerSource::User { file, .. } => Some(file.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let paths = if user_config_paths.is_empty() {
+                    vec![
+                        state
+                            .session_configuration
+                            .codex_home
+                            .join(CONFIG_TOML_FILE),
+                    ]
+                } else {
+                    user_config_paths
+                };
+                (config, paths)
+            };
 
-        let user_config = match std::fs::read_to_string(&config_toml_path) {
-            Ok(contents) => match toml::from_str::<toml::Value>(&contents) {
-                Ok(config) => config,
-                Err(err) => {
-                    warn!("failed to parse user config while reloading layer: {err}");
+            let mut reloaded_user_configs = Vec::with_capacity(config_toml_paths.len());
+            for config_toml_path in config_toml_paths {
+                let user_config = match std::fs::read_to_string(&config_toml_path) {
+                    Ok(contents) => match toml::from_str::<toml::Value>(&contents) {
+                        Ok(config) => config,
+                        Err(err) => {
+                            warn!("failed to parse user config while reloading layer: {err}");
+                            return;
+                        }
+                    },
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        toml::Value::Table(Default::default())
+                    }
+                    Err(err) => {
+                        warn!("failed to read user config while reloading layer: {err}");
+                        return;
+                    }
+                };
+                let Some(config_dir) = config_toml_path.parent() else {
+                    warn!("user config path has no parent directory");
+                    return;
+                };
+                let user_config = match codex_config::loader::resolve_relative_paths_in_config_toml(
+                    user_config,
+                    &config_dir,
+                ) {
+                    Ok(config) => config,
+                    Err(err) => {
+                        warn!("failed to resolve paths while reloading user config: {err}");
+                        return;
+                    }
+                };
+                reloaded_user_configs.push((config_toml_path, user_config));
+            }
+
+            let mut next_config = expected_config.as_ref().clone();
+            for (config_toml_path, user_config) in reloaded_user_configs {
+                let config_layer_stack = match next_config
+                    .config_layer_stack
+                    .with_user_config(&config_toml_path, user_config)
+                {
+                    Ok(config_layer_stack) => config_layer_stack,
+                    Err(err) => {
+                        warn!("failed to validate user config while reloading layer: {err}");
+                        return;
+                    }
+                };
+                next_config.config_layer_stack = config_layer_stack;
+            }
+            match self
+                .refresh_config(
+                    expected_config,
+                    next_config,
+                    crate::config::RuntimeConfigRefresh::UserFiles,
+                )
+                .await
+            {
+                crate::ConfigRefreshOutcome::Stale => continue,
+                crate::ConfigRefreshOutcome::Published | crate::ConfigRefreshOutcome::Rejected => {
                     return;
                 }
-            },
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                toml::Value::Table(Default::default())
             }
-            Err(err) => {
-                warn!("failed to read user config while reloading layer: {err}");
-                return;
-            }
-        };
-
-        let mut state = self.state.lock().await;
-        let mut config = (*state.session_configuration.original_config_do_not_use).clone();
-        config.config_layer_stack = config
-            .config_layer_stack
-            .with_user_config(&config_toml_path, user_config);
-        state.session_configuration.original_config_do_not_use = Arc::new(config);
-        self.services.skills_manager.clear_cache();
-        self.services.plugins_manager.clear_cache();
+        }
     }
 
-    async fn build_settings_update_items(
-        &self,
-        reference_context_item: Option<&TurnContextItem>,
-        current_context: &TurnContext,
-    ) -> Vec<ResponseItem> {
-        // TODO: Make context updates a pure diff of persisted previous/current TurnContextItem
-        // state so replay/backtracking is deterministic. Runtime inputs that affect model-visible
-        // context (shell, exec policy, feature gates, previous-turn bridge) should be persisted
-        // state or explicit non-state replay events.
-        let previous_turn_settings = {
-            let state = self.state.lock().await;
-            state.previous_turn_settings()
+    /// Record a terminal CodexErr before the app-server completion notification is reduced.
+    pub(crate) fn track_turn_codex_error(&self, turn_context: &TurnContext, error: &CodexErr) {
+        self.services
+            .analytics_events_client
+            .track_turn_codex_error(TurnCodexErrorFact::from_codex_err(
+                self.thread_id.to_string(),
+                turn_context.sub_id.clone(),
+                error,
+            ));
+    }
+
+    /// Returns the reviewer pool installed by the Guardian extension.
+    pub(crate) fn guardian_review_session(&self) -> Option<Arc<GuardianReviewSessionManager>> {
+        self.services
+            .thread_extension_data
+            .get::<GuardianReviewSessionManager>()
+    }
+
+    pub(crate) async fn is_private_guardian_reviewer(&self) -> bool {
+        self.state
+            .lock()
+            .await
+            .session_configuration
+            .trusted_guardian_reviewer
+    }
+
+    pub(crate) async fn emit_turn_started(&self, turn_context: &TurnContext, task_kind: TaskKind) {
+        let event = TurnStartedEvent {
+            turn_attribution: (task_kind == TaskKind::Regular).then(|| turn_context.attribution()),
+            turn_id: turn_context.sub_id.clone(),
+            root_turn_id: Some(turn_context.root_turn_id()),
+            trace_id: turn_context.trace_id.clone(),
+            started_at: turn_context.turn_timing_state.started_at_unix_secs().await,
+            model_context_window: turn_context.model_context_window(),
+            collaboration_mode_kind: turn_context.mode(),
         };
-        let shell = self.user_shell();
-        let exec_policy = self.services.exec_policy.current();
-        crate::context_manager::updates::build_settings_update_items(
-            reference_context_item,
-            previous_turn_settings.as_ref(),
-            current_context,
-            shell.as_ref(),
-            exec_policy.as_ref(),
-            self.features.enabled(Feature::Personality),
-        )
+        self.send_event(turn_context, EventMsg::TurnStarted(event))
+            .await;
     }
 
     /// Persist the event to rollout and send it to clients.
     pub(crate) async fn send_event(&self, turn_context: &TurnContext, msg: EventMsg) {
         let legacy_source = msg.clone();
+        if let EventMsg::Error(error) = &legacy_source
+            && error
+                .codex_error_info
+                .as_ref()
+                .is_some_and(CodexErrorInfo::affects_turn_status)
+        {
+            turn_context
+                .terminal_error
+                .lock()
+                .await
+                .replace(error.clone());
+        }
+        self.services
+            .rollout_thread_trace
+            .record_codex_turn_event(&turn_context.sub_id, &legacy_source);
+        self.services
+            .rollout_thread_trace
+            .record_tool_call_event(turn_context.sub_id.clone(), &legacy_source);
         let event = Event {
             id: turn_context.sub_id.clone(),
             msg,
         };
+        // Private reviewers have no app-server listener; publicly resumed Guardian threads do.
+        if matches!(
+            &turn_context.session_source,
+            SessionSource::SubAgent(SubAgentSource::Other(name))
+                if name == crate::guardian::GUARDIAN_REVIEWER_NAME
+        ) && self.services.analytics_events_client.is_enabled()
+            && turn_context.parent_thread_id.is_some()
+            && self
+                .state
+                .lock()
+                .await
+                .session_configuration
+                .trusted_guardian_reviewer
+        {
+            self.services
+                .analytics_events_client
+                .track_guardian_session_event(self.thread_id, &event);
+        }
         self.send_event_raw(event).await;
         self.maybe_notify_parent_of_terminal_turn(turn_context, &legacy_source)
             .await;
@@ -1457,6 +2448,9 @@ impl Session {
 
         let show_raw_agent_reasoning = self.show_raw_agent_reasoning();
         for legacy in legacy_source.as_legacy_events(show_raw_agent_reasoning) {
+            self.services
+                .rollout_thread_trace
+                .record_tool_call_event(turn_context.sub_id.clone(), &legacy);
             let legacy_event = Event {
                 id: turn_context.sub_id.clone(),
                 msg: legacy,
@@ -1471,7 +2465,7 @@ impl Session {
         turn_context: &TurnContext,
         msg: &EventMsg,
     ) {
-        if !self.enabled(Feature::MultiAgentV2) {
+        if turn_context.multi_agent_version != MultiAgentVersion::V2 {
             return;
         }
 
@@ -1480,68 +2474,108 @@ impl Session {
         }
 
         let SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-            parent_thread_id,
-            agent_path: Some(child_agent_path),
+            agent_path: Some(_),
             ..
         }) = &turn_context.session_source
         else {
             return;
         };
 
-        let Some(status) = agent_status_from_event(msg) else {
-            return;
+        let mut error_info = None;
+        let status = match turn_context.terminal_error.lock().await.take() {
+            Some(error) => {
+                let status = AgentStatus::Errored(error.message);
+                self.agent_status.send_replace(status.clone());
+                status
+            }
+            None => {
+                if let EventMsg::TurnAborted(event) = msg
+                    && event.reason == TurnAbortReason::Interrupted
+                    && let Some(error) = &event.error
+                    && error.codex_error_info == Some(CodexErrorInfo::TooManyDenials)
+                {
+                    // Report the safety stop to the parent without changing the child's
+                    // interrupted status or notifying for ordinary interruptions.
+                    error_info = error.codex_error_info.clone();
+                    AgentStatus::Errored(error.message.clone())
+                } else {
+                    let Some(status) = agent_status_from_event(msg) else {
+                        return;
+                    };
+                    status
+                }
+            }
         };
         if !is_final(&status) {
             return;
         }
 
-        self.forward_child_completion_to_parent(*parent_thread_id, child_agent_path, status)
+        self.services
+            .agent_control
+            .turn_finished(
+                AgentTurnOutcome {
+                    thread_id: self.thread_id,
+                    turn_id: turn_context.sub_id.clone(),
+                    source: turn_context.session_source.clone(),
+                    parent_turn_id: turn_context.turn_metadata_state.parent_turn_id(),
+                    initiating_agent_path: turn_context
+                        .turn_metadata_state
+                        .initiating_agent_path()
+                        .cloned(),
+                    status,
+                    error_info,
+                },
+                &self.services.rollout_thread_trace,
+            )
             .await;
     }
 
-    /// Sends the standard completion envelope from a spawned MultiAgentV2 child to its parent.
-    async fn forward_child_completion_to_parent(
-        &self,
-        parent_thread_id: ThreadId,
-        child_agent_path: &codex_protocol::AgentPath,
-        status: AgentStatus,
-    ) {
-        let Some(parent_agent_path) = child_agent_path
-            .as_str()
-            .rsplit_once('/')
-            .and_then(|(parent, _)| codex_protocol::AgentPath::try_from(parent).ok())
-        else {
-            return;
-        };
-
-        let message = format_subagent_notification_message(child_agent_path.as_str(), &status);
-        let communication = InterAgentCommunication::new(
-            child_agent_path.clone(),
-            parent_agent_path,
-            Vec::new(),
-            message,
-            /*trigger_turn*/ false,
-        );
-        if let Err(err) = self
-            .services
-            .agent_control
-            .send_inter_agent_communication(parent_thread_id, communication)
-            .await
-        {
-            debug!("failed to notify parent thread {parent_thread_id}: {err}");
-        }
-    }
-
     async fn maybe_mirror_event_text_to_realtime(&self, msg: &EventMsg) {
-        let Some(text) = realtime_text_for_event(msg) else {
-            return;
-        };
-        if self.conversation.running_state().await.is_none()
-            || self.conversation.active_handoff_id().await.is_none()
-        {
+        if self.conversation.running_state().await.is_none() {
             return;
         }
-        if let Err(err) = self.conversation.handoff_out(text).await {
+        match msg {
+            EventMsg::ItemStarted(event) => {
+                if let TurnItem::AgentMessage(item) = &event.item {
+                    self.conversation
+                        .register_handoff_stream_item(
+                            item.id.clone(),
+                            item.phase.clone(),
+                            agent_message_text(item),
+                        )
+                        .await;
+                }
+                return;
+            }
+            EventMsg::AgentMessageContentDelta(event) => {
+                if let Err(err) = self
+                    .conversation
+                    .stream_handoff_delta(&event.item_id, event.delta.clone())
+                    .await
+                {
+                    debug!("failed to stream event text to realtime conversation: {err}");
+                }
+                return;
+            }
+            EventMsg::ItemCompleted(event) => {
+                if let TurnItem::AgentMessage(item) = &event.item
+                    && self.conversation.finish_handoff_stream_item(&item.id).await
+                {
+                    return;
+                }
+            }
+            _ => {}
+        }
+        let result = match realtime_text_for_event(msg) {
+            Some(RealtimeEventText::Handoff(text, phase)) => {
+                self.conversation.handoff_out(text, phase).await
+            }
+            Some(RealtimeEventText::QuietReasoning(text)) => {
+                self.conversation.send_reasoning_status(&text).await
+            }
+            None => return,
+        };
+        if let Err(err) = result {
             debug!("failed to mirror event text to realtime conversation: {err}");
         }
     }
@@ -1557,9 +2591,71 @@ impl Session {
     }
 
     pub(crate) async fn send_event_raw(&self, event: Event) {
-        // Persist the event into rollout (recorder filters as needed)
-        let rollout_items = vec![RolloutItem::EventMsg(event.msg.clone())];
-        self.persist_rollout_items(&rollout_items).await;
+        self.send_event_raw_with_persistence(event, /*persist*/ true)
+            .await;
+    }
+
+    /// Delivers an event without creating a local rollout for a thread that has not materialized.
+    pub(crate) async fn send_event_raw_without_materializing_rollout(&self, event: Event) {
+        let persist = match self.current_rollout_path().await {
+            Ok(Some(path)) => codex_rollout::existing_rollout_path(&path).await.is_some(),
+            Ok(None) => true,
+            Err(err) => {
+                warn!("failed to check whether thread persistence is materialized: {err}");
+                true
+            }
+        };
+        self.send_event_raw_with_persistence(event, persist).await;
+    }
+
+    async fn send_event_raw_with_persistence(&self, event: Event, persist: bool) {
+        let flush_guardian_completion = persist
+            && matches!(event.msg, EventMsg::TurnComplete(_))
+            && self.is_private_guardian_reviewer().await;
+        // Keep realtime reduction, canonical append, and delivery in the same order.
+        // This lock must not acquire SessionState or ActiveTurn: event producers can
+        // already hold those locks. Host presentation policies are synchronous.
+        let mut realtime_history = match &self.realtime_history {
+            Some(history) => {
+                let history = history.lock().await;
+                history.should_observe(&event.msg).then_some(history)
+            }
+            None => None,
+        };
+        self.services.mcp_runtime.observe_event(&event.msg);
+        let (before_event, after_event) = match realtime_history.as_mut() {
+            Some(history) => {
+                let effects = history.observe(&event.msg);
+                match effects.order {
+                    RealtimeEventOrder::BeforeEvent => (Some(effects), None),
+                    RealtimeEventOrder::AfterEvent => (None, Some(effects)),
+                }
+            }
+            None => (None, None),
+        };
+        if let Some(effects) = before_event
+            && let Err(error) = self.send_realtime_history_effects(&event.id, effects).await
+        {
+            warn!("failed to persist realtime history: {error}");
+        }
+        // Persist the event into rollout storage; the store applies its persistence policy.
+        if persist {
+            let rollout_items = vec![RolloutItem::EventMsg(event.msg.clone())];
+            self.persist_rollout_items(&rollout_items).await;
+        }
+        self.services
+            .rollout_thread_trace
+            .record_protocol_event(&event.msg);
+        if let Some(effects) = after_event
+            && let Err(error) = self.send_realtime_history_effects(&event.id, effects).await
+        {
+            warn!("failed to persist realtime history: {error}");
+        }
+        // Save the completed review and its terminal event together before the parent sees
+        // the decision. Turn completion skips its separate before/after barriers for this case.
+        if flush_guardian_completion && let Err(err) = self.flush_rollout().await {
+            warn!("failed to flush completed Guardian review: {err}");
+        }
         self.deliver_event_raw(event).await;
     }
 
@@ -1574,12 +2670,17 @@ impl Session {
     }
 
     pub(crate) async fn emit_turn_item_started(&self, turn_context: &TurnContext, item: &TurnItem) {
+        let started_at_ms = turn_context
+            .turn_timing_state
+            .record_item_started(item.id(), now_unix_timestamp_ms())
+            .await;
         self.send_event(
             turn_context,
             EventMsg::ItemStarted(ItemStartedEvent {
-                thread_id: self.conversation_id,
+                thread_id: self.thread_id,
                 turn_id: turn_context.sub_id.clone(),
                 item: item.clone(),
+                started_at_ms,
             }),
         )
         .await;
@@ -1591,12 +2692,38 @@ impl Session {
         item: TurnItem,
     ) {
         record_turn_ttfm_metric(turn_context, &item).await;
+        for contributor in self.services.extensions.turn_lifecycle_contributors() {
+            contributor
+                .on_item_completed(
+                    &self.services.thread_extension_data,
+                    turn_context.extension_data.as_ref(),
+                    &item,
+                )
+                .await;
+        }
+        let completed_at_ms = now_unix_timestamp_ms();
+        let item_id = item.id();
+        let started_at_ms = turn_context
+            .turn_timing_state
+            .take_item_started(&item_id)
+            .await
+            .unwrap_or_else(|| {
+                warn!(
+                    thread_id = %self.thread_id,
+                    turn_id = %turn_context.sub_id,
+                    item_id = %item_id,
+                    "item completed without a recorded start timestamp"
+                );
+                completed_at_ms
+            });
         self.send_event(
             turn_context,
             EventMsg::ItemCompleted(ItemCompletedEvent {
-                thread_id: self.conversation_id,
+                thread_id: self.thread_id,
                 turn_id: turn_context.sub_id.clone(),
                 item,
+                started_at_ms: Some(started_at_ms),
+                completed_at_ms,
             }),
         )
         .await;
@@ -1628,7 +2755,8 @@ impl Session {
         let active = self.active_turn.lock().await;
         active
             .as_ref()
-            .and_then(|turn| turn.tasks.get(sub_id))
+            .and_then(|turn| turn.task.as_ref())
+            .filter(|task| task.turn_context.sub_id == sub_id)
             .map(|task| Arc::clone(&task.turn_context))
     }
 
@@ -1636,47 +2764,18 @@ impl Session {
         &self,
     ) -> Option<(Arc<TurnContext>, CancellationToken)> {
         let active = self.active_turn.lock().await;
-        let (_, task) = active.as_ref()?.tasks.first()?;
+        let task = active.as_ref()?.task.as_ref()?;
         Some((
             Arc::clone(&task.turn_context),
             task.cancellation_token.child_token(),
         ))
     }
 
-    pub(crate) async fn record_execpolicy_amendment_message(
-        &self,
-        sub_id: &str,
-        amendment: &ExecPolicyAmendment,
-    ) {
-        let Some(prefixes) = format_allow_prefixes(vec![amendment.command.clone()]) else {
-            warn!("execpolicy amendment for {sub_id} had no command prefix");
-            return;
-        };
-        let text = format!("Approved command prefix saved:\n{prefixes}");
-        let message: ResponseItem = DeveloperInstructions::new(text.clone()).into();
-
-        if let Some(turn_context) = self.turn_context_for_sub_id(sub_id).await {
-            self.record_conversation_items(&turn_context, std::slice::from_ref(&message))
-                .await;
-            return;
-        }
-
-        if self
-            .inject_response_items(vec![ResponseInputItem::Message {
-                role: "developer".to_string(),
-                content: vec![ContentItem::InputText { text }],
-            }])
-            .await
-            .is_err()
-        {
-            warn!("no active turn found to record execpolicy amendment message for {sub_id}");
-        }
-    }
-
     pub(crate) async fn persist_network_policy_amendment(
         &self,
         amendment: &NetworkPolicyAmendment,
         network_approval_context: &NetworkApprovalContext,
+        on_policy_applied: impl FnOnce() + Send,
     ) -> anyhow::Result<()> {
         let _refresh_guard = self
             .managed_network_proxy_refresh_lock
@@ -1694,8 +2793,9 @@ impl Session {
             .clone();
         let execpolicy_amendment =
             execpolicy_network_rule_amendment(amendment, network_approval_context, &host);
+        let mut on_policy_applied = Some(on_policy_applied);
 
-        if let Some(started_network_proxy) = self.services.network_proxy.as_ref() {
+        if let Some(started_network_proxy) = self.services.network_proxy.load_full() {
             let proxy = started_network_proxy.proxy();
             match amendment.action {
                 NetworkPolicyRuleAction::Allow => proxy
@@ -1706,6 +2806,11 @@ impl Session {
                     .add_denied_domain(&host)
                     .await
                     .map_err(|err| anyhow::anyhow!("failed to update runtime denylist: {err}"))?,
+            }
+            // Active enforcement changed successfully. Notify the owner before
+            // the next fallible await so cancellation cannot contradict it.
+            if let Some(on_policy_applied) = on_policy_applied.take() {
+                on_policy_applied();
             }
         }
 
@@ -1722,6 +2827,11 @@ impl Session {
             .map_err(|err| {
                 anyhow::anyhow!("failed to persist network policy amendment to execpolicy: {err}")
             })?;
+
+        // Without a running proxy, persistence is the first effective policy change.
+        if let Some(on_policy_applied) = on_policy_applied {
+            on_policy_applied();
+        }
 
         Ok(())
     }
@@ -1747,32 +2857,10 @@ impl Session {
         sub_id: &str,
         amendment: &NetworkPolicyAmendment,
     ) {
-        let (action, list_name) = match amendment.action {
-            NetworkPolicyRuleAction::Allow => ("Allowed", "allowlist"),
-            NetworkPolicyRuleAction::Deny => ("Denied", "denylist"),
-        };
-        let text = format!(
-            "{action} network rule saved in execpolicy ({list_name}): {}",
-            amendment.host
-        );
-        let message: ResponseItem = DeveloperInstructions::new(text.clone()).into();
-
-        if let Some(turn_context) = self.turn_context_for_sub_id(sub_id).await {
-            self.record_conversation_items(&turn_context, std::slice::from_ref(&message))
-                .await;
-            return;
-        }
-
-        if self
-            .inject_response_items(vec![ResponseInputItem::Message {
-                role: "developer".to_string(),
-                content: vec![ContentItem::InputText { text }],
-            }])
-            .await
-            .is_err()
-        {
-            warn!("no active turn found to record network policy amendment message for {sub_id}");
-        }
+        let message: ResponseItem = ContextualUserFragment::into(NetworkRuleSaved::new(amendment));
+        let turn_context = self.turn_context_for_sub_id(sub_id).await;
+        self.inject_no_new_turn(vec![message], turn_context.as_deref())
+            .await;
     }
 
     /// Emit an exec approval request event and await the user's decision.
@@ -1793,18 +2881,23 @@ impl Session {
     pub async fn request_command_approval(
         &self,
         turn_context: &TurnContext,
+        kind: ExecApprovalKind,
+        model_context: ModelInvocationContext,
         call_id: String,
         approval_id: Option<String>,
+        environment_id: Option<String>,
         command: Vec<String>,
-        cwd: AbsolutePathBuf,
+        cwd: PathUri,
         reason: Option<String>,
         network_approval_context: Option<NetworkApprovalContext>,
         proposed_execpolicy_amendment: Option<ExecPolicyAmendment>,
-        additional_permissions: Option<PermissionProfile>,
+        additional_permissions: Option<AdditionalPermissionProfile>,
         available_decisions: Option<Vec<ReviewDecision>>,
+        plugin_attribution_override: Option<PluginCommandAttribution>,
     ) -> ReviewDecision {
+        let _elicitation = self.services.elicitations.register();
         //  command-level approvals use `call_id`.
-        // `approval_id` is only present for subcommand callbacks (execve intercept)
+        // `approval_id` identifies subcommand callbacks and stdin writes.
         let effective_approval_id = approval_id.clone().unwrap_or_else(|| call_id.clone());
         // Add the tx_approve callback to the map before sending the request.
         let (tx_approve, rx_approve) = oneshot::channel();
@@ -1843,12 +2936,27 @@ impl Session {
                 additional_permissions.as_ref(),
             )
         });
+        let plugin_attribution = plugin_attribution_override.or_else(|| {
+            cwd.to_abs_path()
+                .ok()
+                .and_then(|cwd| turn_context.plugin_attribution_for_command(&command, &cwd))
+        });
+        let (plugin_id, script_path) = plugin_attribution
+            .as_ref()
+            .map(PluginCommandAttribution::serialized_fields)
+            .unzip();
         let event = EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
+            model_context: Some(model_context),
+            kind,
             call_id,
+            plugin_id,
+            script_path,
             approval_id,
             turn_id: turn_context.sub_id.clone(),
+            environment_id,
+            started_at_ms: now_unix_timestamp_ms(),
             command,
-            cwd,
+            cwd: cwd.into(),
             reason,
             network_approval_context,
             proposed_execpolicy_amendment,
@@ -1872,7 +2980,8 @@ impl Session {
         changes: HashMap<PathBuf, FileChange>,
         reason: Option<String>,
         grant_root: Option<PathBuf>,
-    ) -> oneshot::Receiver<ReviewDecision> {
+    ) -> ReviewDecision {
+        let _elicitation = self.services.elicitations.register();
         // Add the tx_approve callback to the map before sending the request.
         let (tx_approve, rx_approve) = oneshot::channel();
         let approval_id = call_id.clone();
@@ -1893,30 +3002,50 @@ impl Session {
         let event = EventMsg::ApplyPatchApprovalRequest(ApplyPatchApprovalRequestEvent {
             call_id,
             turn_id: turn_context.sub_id.clone(),
+            started_at_ms: now_unix_timestamp_ms(),
             changes,
             reason,
             grant_root,
         });
         self.send_event(turn_context, event).await;
-        rx_approve
+        rx_approve.await.unwrap_or(ReviewDecision::Abort)
     }
 
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "active turn checks and turn state updates must remain atomic"
     )]
-    pub async fn request_permissions(
+    pub(crate) async fn request_permissions_for_environment(
         self: &Arc<Self>,
-        turn_context: &Arc<TurnContext>,
+        step_context: &Arc<StepContext>,
         call_id: String,
         args: RequestPermissionsArgs,
+        environment_selection: TurnEnvironmentSelection,
         cancellation_token: CancellationToken,
     ) -> Option<RequestPermissionsResponse> {
-        match turn_context.as_ref().approval_policy.value() {
+        let turn_context = &step_context.turn;
+        let approval_policy = step_context.settings.approval_policy();
+        let Some(environment) = step_context
+            .environments
+            .turn_environments()
+            .find(|candidate| {
+                candidate.selection.environment_id == environment_selection.environment_id
+            })
+            .cloned()
+        else {
+            return Some(RequestPermissionsResponse {
+                permissions: RequestPermissionProfile::default(),
+                scope: PermissionGrantScope::Turn,
+                strict_auto_review: false,
+            });
+        };
+        let cwd = environment.cwd();
+        match approval_policy {
             AskForApproval::Never => {
                 return Some(RequestPermissionsResponse {
                     permissions: RequestPermissionProfile::default(),
                     scope: PermissionGrantScope::Turn,
+                    strict_auto_review: false,
                 });
             }
             AskForApproval::Granular(granular_config)
@@ -1925,87 +3054,107 @@ impl Session {
                 return Some(RequestPermissionsResponse {
                     permissions: RequestPermissionProfile::default(),
                     scope: PermissionGrantScope::Turn,
+                    strict_auto_review: false,
                 });
             }
-            AskForApproval::OnFailure
-            | AskForApproval::OnRequest
+            AskForApproval::OnRequest
             | AskForApproval::UnlessTrusted
             | AskForApproval::Granular(_) => {}
         }
 
-        if crate::guardian::routes_approval_to_guardian(turn_context.as_ref()) {
-            let requested_permissions = args.permissions;
-            let originating_turn_state = {
-                let active = self.active_turn.lock().await;
-                active.as_ref().map(|active| Arc::clone(&active.turn_state))
-            };
-            let review_id = crate::guardian::new_guardian_review_id();
-            let session = Arc::clone(self);
-            let turn = Arc::clone(turn_context);
-            let request = crate::guardian::GuardianApprovalRequest::RequestPermissions {
-                id: call_id,
+        let requested_permissions = args.permissions;
+        let sandbox_context = environment.sandbox_context(/*additional_permissions*/ None);
+        let context = sandbox_context.policy_context();
+        {
+            let action = ApprovalAction::RequestPermissions {
+                id: call_id.clone(),
+                environment_id: environment_selection.environment_id.clone(),
                 turn_id: turn_context.sub_id.clone(),
-                reason: args.reason,
+                reason: args.reason.clone(),
                 permissions: requested_permissions.clone(),
             };
-            let review_rx = crate::guardian::spawn_approval_request_review(
-                session,
-                turn,
-                review_id,
-                request,
-                /*retry_reason*/ None,
-                cancellation_token.clone(),
-            );
+            let approval_context = ApprovalContext {
+                review_context: crate::guardian::GuardianReviewContext::from(step_context),
+                cancellation_token: Some(cancellation_token.clone()),
+                call_id: call_id.clone(),
+                tool_name: ToolName::plain("request_permissions"),
+                strict_auto_review: false,
+                approval_reason: None,
+                retry_reason: None,
+                network_approval_context: None,
+            };
             let decision = tokio::select! {
                 biased;
                 _ = cancellation_token.cancelled() => return None,
-                decision = review_rx => decision.unwrap_or(ReviewDecision::Denied),
+                decision = self.request_guardian_approval(
+                    action,
+                    &approval_context,
+                ) => decision,
             };
-            let response = match decision {
-                ReviewDecision::Approved | ReviewDecision::ApprovedExecpolicyAmendment { .. } => {
-                    RequestPermissionsResponse {
-                        permissions: requested_permissions,
-                        scope: PermissionGrantScope::Turn,
+            if let Some(decision) = decision {
+                let (permissions, scope) = match decision {
+                    ReviewDecision::Approved
+                    | ReviewDecision::ApprovedExecpolicyAmendment { .. }
+                    | ReviewDecision::NetworkPolicyAmendment {
+                        network_policy_amendment:
+                            NetworkPolicyAmendment {
+                                action: NetworkPolicyRuleAction::Allow,
+                                ..
+                            },
+                    } => (requested_permissions.clone(), PermissionGrantScope::Turn),
+                    ReviewDecision::ApprovedForSession => {
+                        (requested_permissions.clone(), PermissionGrantScope::Session)
                     }
-                }
-                ReviewDecision::ApprovedForSession => RequestPermissionsResponse {
-                    permissions: requested_permissions,
-                    scope: PermissionGrantScope::Session,
-                },
-                ReviewDecision::NetworkPolicyAmendment {
-                    network_policy_amendment,
-                } => match network_policy_amendment.action {
-                    NetworkPolicyRuleAction::Allow => RequestPermissionsResponse {
-                        permissions: requested_permissions,
-                        scope: PermissionGrantScope::Turn,
-                    },
-                    NetworkPolicyRuleAction::Deny => RequestPermissionsResponse {
-                        permissions: RequestPermissionProfile::default(),
-                        scope: PermissionGrantScope::Turn,
-                    },
-                },
-                ReviewDecision::Abort | ReviewDecision::Denied | ReviewDecision::TimedOut => {
-                    RequestPermissionsResponse {
-                        permissions: RequestPermissionProfile::default(),
-                        scope: PermissionGrantScope::Turn,
+                    ReviewDecision::ApprovedMcpPolicyAmendment
+                    | ReviewDecision::NetworkPolicyAmendment {
+                        network_policy_amendment:
+                            NetworkPolicyAmendment {
+                                action: NetworkPolicyRuleAction::Deny,
+                                ..
+                            },
                     }
-                }
-            };
-            self.record_granted_request_permissions_for_turn(
-                &response,
-                originating_turn_state.as_ref(),
-            )
-            .await;
-            return Some(response);
+                    | ReviewDecision::Abort
+                    | ReviewDecision::Denied { .. }
+                    | ReviewDecision::TimedOut => (
+                        RequestPermissionProfile::default(),
+                        PermissionGrantScope::Turn,
+                    ),
+                };
+                let response = RequestPermissionsResponse {
+                    permissions,
+                    scope,
+                    strict_auto_review: false,
+                };
+                let response = Self::normalize_request_permissions_response(
+                    requested_permissions,
+                    response,
+                    &context,
+                );
+                self.record_granted_request_permissions_for_turn(
+                    &response,
+                    &environment.selection.environment_id,
+                    turn_context,
+                );
+                return Some(response);
+            }
         }
 
+        let _elicitation = self.services.elicitations.register();
         let (tx_response, rx_response) = oneshot::channel();
         let prev_entry = {
             let mut active = self.active_turn.lock().await;
             match active.as_mut() {
                 Some(at) => {
                     let mut ts = at.turn_state.lock().await;
-                    ts.insert_pending_request_permissions(call_id.clone(), tx_response)
+                    ts.insert_pending_request_permissions(
+                        call_id.clone(),
+                        PendingRequestPermissions {
+                            tx_response,
+                            requested_permissions: requested_permissions.clone(),
+                            environment: environment.clone(),
+                            turn_context: Arc::clone(turn_context),
+                        },
+                    )
                 }
                 None => None,
             }
@@ -2017,8 +3166,11 @@ impl Session {
         let event = EventMsg::RequestPermissions(RequestPermissionsEvent {
             call_id: call_id.clone(),
             turn_id: turn_context.sub_id.clone(),
+            environment_id: Some(environment.selection.environment_id.clone()),
+            started_at_ms: now_unix_timestamp_ms(),
             reason: args.reason,
-            permissions: args.permissions,
+            permissions: requested_permissions,
+            cwd: Some(cwd.clone().into()),
         });
         self.send_event(turn_context.as_ref(), event).await;
         tokio::select! {
@@ -2039,12 +3191,13 @@ impl Session {
         clippy::await_holding_invalid_type,
         reason = "active turn checks and turn state updates must remain atomic"
     )]
-    pub async fn request_user_input(
+    pub(crate) async fn request_user_input(
         &self,
         turn_context: &TurnContext,
         call_id: String,
         args: RequestUserInputArgs,
-    ) -> Option<RequestUserInputResponse> {
+    ) -> Option<AcceptedUserInputResponse> {
+        let _elicitation = self.services.elicitations.register();
         let sub_id = turn_context.sub_id.clone();
         let (tx_response, rx_response) = oneshot::channel();
         let event_id = sub_id.clone();
@@ -2066,7 +3219,12 @@ impl Session {
             call_id,
             turn_id: turn_context.sub_id.clone(),
             questions: args.questions,
+            is_blocking: args.is_blocking,
+            auto_resolution_ms: args.auto_resolution_ms,
         });
+        turn_context
+            .turn_metadata_state
+            .mark_user_input_requested_during_turn();
         self.send_event(turn_context, event).await;
         rx_response.await.ok()
     }
@@ -2084,15 +3242,23 @@ impl Session {
             let mut active = self.active_turn.lock().await;
             match active.as_mut() {
                 Some(at) => {
-                    let mut ts = at.turn_state.lock().await;
-                    ts.remove_pending_user_input(sub_id)
+                    let sender = at.turn_state.lock().await.remove_pending_user_input(sub_id);
+                    match sender {
+                        Some(sender) => Some((sender, self.reserve_user_input_order().await)),
+                        None => None,
+                    }
                 }
                 None => None,
             }
         };
         match entry {
-            Some(tx_response) => {
-                tx_response.send(response).ok();
+            Some((tx_response, acceptance_order)) => {
+                tx_response
+                    .send(AcceptedUserInputResponse {
+                        response,
+                        acceptance_order,
+                    })
+                    .ok();
             }
             None => {
                 warn!("No pending user input found for sub_id: {sub_id}");
@@ -2109,28 +3275,32 @@ impl Session {
         call_id: &str,
         response: RequestPermissionsResponse,
     ) {
-        let (entry, originating_turn_state) = {
+        let entry = {
             let mut active = self.active_turn.lock().await;
             match active.as_mut() {
                 Some(at) => {
                     let mut ts = at.turn_state.lock().await;
-                    let entry = ts.remove_pending_request_permissions(call_id);
-                    let originating_turn_state = entry.as_ref().map(|_| Arc::clone(&at.turn_state));
-                    (entry, originating_turn_state)
+                    ts.remove_pending_request_permissions(call_id)
                 }
-                None => (None, None),
+                None => None,
             }
         };
-        if entry.is_some() {
-            self.record_granted_request_permissions_for_turn(
-                &response,
-                originating_turn_state.as_ref(),
-            )
-            .await;
-        }
         match entry {
-            Some(tx_response) => {
-                tx_response.send(response).ok();
+            Some(entry) => {
+                let sandbox_context = entry
+                    .environment
+                    .sandbox_context(/*additional_permissions*/ None);
+                let response = Self::normalize_request_permissions_response(
+                    entry.requested_permissions,
+                    response,
+                    &sandbox_context.policy_context(),
+                );
+                self.record_granted_request_permissions_for_turn(
+                    &response,
+                    &entry.environment.selection.environment_id,
+                    &entry.turn_context,
+                );
+                entry.tx_response.send(response).ok();
             }
             None => {
                 warn!("No pending request_permissions found for call_id: {call_id}");
@@ -2138,42 +3308,78 @@ impl Session {
         }
     }
 
-    async fn record_granted_request_permissions_for_turn(
+    fn normalize_request_permissions_response(
+        requested_permissions: RequestPermissionProfile,
+        response: RequestPermissionsResponse,
+        context: &FileSystemSandboxPolicyContext<'_>,
+    ) -> RequestPermissionsResponse {
+        if response.strict_auto_review && matches!(response.scope, PermissionGrantScope::Session) {
+            return RequestPermissionsResponse {
+                permissions: RequestPermissionProfile::default(),
+                scope: PermissionGrantScope::Turn,
+                strict_auto_review: false,
+            };
+        }
+
+        if response.permissions.is_empty() {
+            return response;
+        }
+
+        RequestPermissionsResponse {
+            permissions: intersect_permission_profiles_with_context(
+                requested_permissions.into(),
+                response.permissions.into(),
+                context,
+            )
+            .into(),
+            scope: response.scope,
+            strict_auto_review: response.strict_auto_review,
+        }
+    }
+
+    fn record_granted_request_permissions_for_turn(
         &self,
         response: &RequestPermissionsResponse,
-        originating_turn_state: Option<&Arc<Mutex<crate::state::TurnState>>>,
+        environment_id: &str,
+        turn_context: &TurnContext,
     ) {
         if response.permissions.is_empty() {
             return;
         }
         match response.scope {
             PermissionGrantScope::Turn => {
-                if let Some(turn_state) = originating_turn_state {
-                    let mut ts = turn_state.lock().await;
-                    ts.record_granted_permissions(response.permissions.clone().into());
-                }
+                let permissions: AdditionalPermissionProfile = response.permissions.clone().into();
+                turn_context.record_granted_permissions(
+                    environment_id,
+                    permissions,
+                    response.strict_auto_review,
+                );
             }
             PermissionGrantScope::Session => {
-                let mut state = self.state.lock().await;
-                state.record_granted_permissions(response.permissions.clone().into());
+                self.services.record_granted_permissions(
+                    environment_id,
+                    response.permissions.clone().into(),
+                );
             }
         }
     }
 
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "active turn reads must stay consistent with the matching turn state"
-    )]
-    pub(crate) async fn granted_turn_permissions(&self) -> Option<PermissionProfile> {
+    pub(crate) async fn active_turn_context_and_strict_auto_review(
+        &self,
+    ) -> Option<(
+        Arc<TurnContext>,
+        Arc<ResolvedStepSettings>,
+        TurnEnvironmentSnapshot,
+        bool,
+    )> {
         let active = self.active_turn.lock().await;
         let active = active.as_ref()?;
-        let ts = active.turn_state.lock().await;
-        ts.granted_permissions()
-    }
-
-    pub(crate) async fn granted_session_permissions(&self) -> Option<PermissionProfile> {
-        let state = self.state.lock().await;
-        state.granted_permissions()
+        let task = active.task.as_ref()?;
+        let turn_context = Arc::clone(&task.turn_context);
+        let settings = turn_context.next_step_settings.load_full();
+        let strict_auto_review = turn_context.strict_auto_review_enabled();
+        let environments = self.services.turn_environments.snapshot_now();
+        Some((turn_context, settings, environments, strict_auto_review))
     }
 
     #[expect(
@@ -2226,51 +3432,632 @@ impl Session {
         }
     }
 
-    /// Records input items: always append to conversation history and
-    /// persist these response items to rollout.
+    pub(crate) fn response_item_create_time() -> serde_json::Number {
+        let create_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        serde_json::Number::from_f64(create_time.as_secs_f64())
+            .unwrap_or_else(|| serde_json::Number::from(create_time.as_secs()))
+    }
+
+    /// Adds the turn ID and creation time to newly created conversation items.
+    pub(crate) fn stamp_response_item_for_history(item: &mut ResponseItem, turn_id: &str) {
+        item.set_turn_id_if_missing(turn_id);
+        item.set_create_time_if_missing(Self::response_item_create_time());
+    }
+
+    /// Prepares media using the originating model and preserves existing item identity.
+    pub(crate) async fn prepare_conversation_items_for_history<'a>(
+        &self,
+        turn_context: &TurnContext,
+        model_info: &ModelInfo,
+        items: &'a [ResponseItem],
+    ) -> (Cow<'a, [ResponseItem]>, Vec<ImagePreparationMetadata>) {
+        let mut items = items.to_vec();
+        let image_preparation_mode =
+            if unified_image_budget_enabled(&turn_context.config.features, model_info) {
+                ImagePreparationMode::UnifiedBudget
+            } else {
+                ImagePreparationMode::DetailBased
+            };
+        let image_resize_notice_mode = if turn_context
+            .config
+            .features
+            .enabled(Feature::ImageResizeNotice)
+        {
+            ImageResizeNoticeMode::Enabled
+        } else {
+            ImageResizeNoticeMode::Disabled
+        };
+        // Keep nested image-upload futures out of every caller's future frame.
+        let image_preparations = Box::pin(prepare_image_response_items(
+            &self.thread_id.to_string(),
+            turn_context.config.ephemeral,
+            &mut items,
+            image_preparation_mode,
+            image_resize_notice_mode,
+            self.services.image_store.as_ref(),
+        ))
+        .await;
+        prepare_audio_response_items(&mut items);
+        // Most response items get their passthrough turn ID at the durable history boundary.
+        for item in &mut items {
+            Self::stamp_response_item_for_history(item, &turn_context.sub_id);
+        }
+        let items = Cow::Owned(items);
+        (
+            Self::assign_missing_response_item_ids(items),
+            image_preparations,
+        )
+    }
+
+    fn assign_missing_response_item_ids(items: Cow<'_, [ResponseItem]>) -> Cow<'_, [ResponseItem]> {
+        if items
+            .iter()
+            .all(|item| item.id().is_some_and(|id| !id.is_empty()))
+        {
+            return items;
+        }
+        let mut items = items;
+        for item in items.to_mut() {
+            Self::assign_missing_response_item_id(item);
+        }
+        items
+    }
+
+    pub(crate) fn assign_missing_response_item_id(item: &mut ResponseItem) {
+        if item.id().is_some_and(|id| !id.is_empty()) {
+            return;
+        }
+        let Some(prefix) = item.id_prefix() else {
+            return;
+        };
+        item.set_id(Some(ResponseItemId::new(prefix)));
+    }
+
+    fn assign_missing_rollout_response_item_ids(items: &mut [RolloutItem]) {
+        for item in items {
+            if let RolloutItem::ResponseItem(response_item) = item {
+                Self::assign_missing_response_item_id(&mut response_item.item);
+            }
+        }
+    }
+
+    pub(crate) fn response_item_from_user_input(&self, input: Vec<UserInput>) -> ResponseItem {
+        self.response_item_from_user_input_with_image_positions(input, &mut HashMap::new())
+    }
+
+    fn response_item_from_user_input_with_image_positions(
+        &self,
+        input: Vec<UserInput>,
+        user_image_content_indices: &mut HashMap<usize, usize>,
+    ) -> ResponseItem {
+        let mut item = ResponseItem::from(ResponseInputItem::from_user_input(
+            input,
+            LocalImagePreparation::Defer,
+            user_image_content_indices,
+        ));
+        if let ResponseItem::Message {
+            content,
+            internal_chat_message_metadata_passthrough,
+            ..
+        } = &mut item
+        {
+            let content_item_kinds = content
+                .iter()
+                .map(|content| {
+                    ContentItemKind(
+                        match content {
+                            ContentItem::InputText { .. } | ContentItem::OutputText { .. } => {
+                                "user.text"
+                            }
+                            ContentItem::InputImage { .. } => "user.image",
+                            ContentItem::InputAudio { .. } => "user.audio",
+                        }
+                        .to_string(),
+                    )
+                })
+                .collect();
+            *internal_chat_message_metadata_passthrough =
+                Some(InternalChatMessageMetadataPassthrough {
+                    content_item_kinds: Some(content_item_kinds),
+                    ..Default::default()
+                });
+        }
+        item
+    }
+
+    /// Appends to history, persists the prepared items, then notifies raw-item observers.
+    /// Execution callers supply their captured model; standalone callers need no tool runtime.
+    #[tracing::instrument(level = "trace", skip_all, fields(item_count = items.len()))]
     pub(crate) async fn record_conversation_items(
         &self,
         turn_context: &TurnContext,
+        model_info: &ModelInfo,
         items: &[ResponseItem],
     ) {
-        self.record_into_history(items, turn_context).await;
-        self.persist_rollout_response_items(items).await;
-        self.send_raw_response_items(turn_context, items).await;
+        let (items, image_preparations) = self
+            .prepare_conversation_items_for_history(turn_context, model_info, items)
+            .await;
+        let items = items
+            .into_owned()
+            .into_iter()
+            .map(ResponseItemEnvelope::new)
+            .collect();
+        self.record_prepared_conversation_items(
+            turn_context,
+            model_info,
+            items,
+            image_preparations,
+        )
+        .await;
     }
 
-    /// Append ResponseItems to the in-memory conversation history only.
-    pub(crate) async fn record_into_history(
+    async fn record_prepared_conversation_items(
         &self,
-        items: &[ResponseItem],
         turn_context: &TurnContext,
+        model_info: &ModelInfo,
+        mut items: Vec<ResponseItemEnvelope>,
+        image_preparations: Vec<ImagePreparationMetadata>,
     ) {
-        let mut state = self.state.lock().await;
-        state.record_items(items.iter(), turn_context.truncation_policy);
+        // Save the originating history budget for replay.
+        // Preserve any existing tool-specific override.
+        let policy: codex_utils_output_truncation::TruncationPolicy =
+            model_info.truncation_policy.into();
+        for envelope in &mut items {
+            if matches!(
+                envelope.item,
+                ResponseItem::FunctionCallOutput { .. } | ResponseItem::CustomToolCallOutput { .. }
+            ) {
+                envelope
+                    .metadata
+                    .get_or_insert_default()
+                    .history_truncation_token_limit
+                    .get_or_insert_with(|| with_serialization_allowance(policy).token_budget());
+            }
+        }
+        // Last-N-turn forks retain a suffix starting at a user turn boundary. Repeat the
+        // cumulative checkpoint there so the suffix remains self-contained even when the fork
+        // happens mid-turn; dirty checkpoints preserve new sources between boundaries.
+        let force_mcp_checkpoint = items
+            .iter()
+            .any(|envelope| crate::context_manager::is_user_turn_boundary(&envelope.item));
+        let mcp_revision = self
+            .services
+            .executed_tool_calls
+            .mcp_attribution_checkpoint(force_mcp_checkpoint)
+            .and_then(|(attribution, revision)| {
+                let first_persisted = items
+                    .iter()
+                    .position(|envelope| should_persist_response_item(&envelope.item))?;
+                for (index, envelope) in items.iter_mut().enumerate() {
+                    // Rollout batches may be partially written. Checkpoint the first persisted
+                    // item, and repeat the checkpoint at turn boundaries retained by forks.
+                    if index == first_persisted
+                        || crate::context_manager::is_user_turn_boundary(&envelope.item)
+                    {
+                        envelope.metadata.get_or_insert_default().mcp_attribution =
+                            Some(attribution.clone());
+                    }
+                }
+                Some(revision)
+            });
+        let response_items = items
+            .iter()
+            .map(|envelope| envelope.item.clone())
+            .collect::<Vec<_>>();
+        {
+            let mut state = self.state.lock().await;
+            state
+                .current_time_reminder
+                .note_recorded_items(&response_items);
+            let pending_orders = turn_context
+                .extension_data
+                .get::<retained_context::PendingAssistantMessageOrders>();
+            for envelope in &mut items {
+                if envelope
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.compaction_output)
+                {
+                    continue;
+                }
+                if matches!(&envelope.item, ResponseItem::Message { role, .. } if role == "assistant")
+                    || matches!(&envelope.item, ResponseItem::FunctionCall { .. })
+                    || crate::context::is_user_authorization_message(&envelope.item)
+                {
+                    let message_order = pending_orders.as_ref().and_then(|orders| {
+                        orders
+                            .0
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .remove(envelope.item.id()?.as_str())
+                    });
+                    // Preserve input acceptance and source-message start order.
+                    // Synthetic messages still receive their order here.
+                    envelope
+                        .metadata
+                        .get_or_insert_default()
+                        .user_input_order
+                        .get_or_insert_with(|| {
+                            message_order.unwrap_or_else(|| state.history.reserve_input_order())
+                        });
+                }
+            }
+            state
+                .history
+                .record_annotated_items(&mut items, model_info.truncation_policy.into());
+        }
+        for image in image_preparations {
+            self.services
+                .analytics_events_client
+                .track_image_preparation(ImagePreparationFact {
+                    turn_id: turn_context.sub_id.clone(),
+                    metadata: image,
+                });
+        }
+        let rollout_items: Vec<RolloutItem> =
+            items.into_iter().map(RolloutItem::ResponseItem).collect();
+        if self.persist_rollout_items(&rollout_items).await
+            && let Some(revision) = mcp_revision
+        {
+            self.services
+                .executed_tool_calls
+                .mark_mcp_attribution_persisted(revision);
+        }
+        if turn_context.config.memories.disable_on_external_context
+            && let Some(item) = response_items
+                .iter()
+                .find(|item| matches!(item, ResponseItem::FunctionCallOutput { call_id: None, .. }))
+        {
+            mark_thread_memory_mode_polluted_if_external_context(self, turn_context, item).await;
+        }
+        self.send_raw_response_items(turn_context, &response_items)
+            .await;
     }
 
-    pub(crate) async fn record_model_warning(&self, message: impl Into<String>, ctx: &TurnContext) {
-        self.services
-            .session_telemetry
-            .counter("codex.model_warning", /*inc*/ 1, &[]);
-        let item = ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![ContentItem::InputText {
-                text: format!("Warning: {}", message.into()),
-            }],
-            end_turn: None,
-            phase: None,
-        };
+    pub(crate) async fn record_step_world_state_if_changed(
+        &self,
+        step_context: &step_context::StepContext,
+    ) -> CodexResult<()> {
+        let turn_context = step_context.turn.as_ref();
+        // Render model-visible state from the same step used to build and run tools.
+        let world_state = self
+            .build_world_state_for_step(step_context, /*new_window*/ false)
+            .await?;
+        let (world_state_snapshot, fragments, world_state_item) = self
+            .state
+            .lock()
+            .await
+            .history
+            .render_step_world_state(&world_state);
+        let items = crate::context_manager::updates::merge_world_state_updates(fragments);
+        if !items.is_empty() {
+            self.record_conversation_items(turn_context, &step_context.settings.model_info, &items)
+                .await;
+        }
 
-        self.record_conversation_items(ctx, &[item]).await;
+        self.state
+            .lock()
+            .await
+            .history
+            .set_world_state_baseline(world_state_snapshot);
+        // Record the patch after the context it describes is present in model history.
+        if let Some(world_state_item) = world_state_item {
+            self.persist_rollout_items(&[RolloutItem::WorldState(world_state_item)])
+                .await;
+        }
+        Ok(())
+    }
+
+    /// Retains the step captured for execution.
+    pub(crate) async fn set_last_known_step_context(&self, step_context: &Arc<StepContext>) {
+        let turn_state = {
+            let active_turn = self.active_turn.lock().await;
+            active_turn.as_ref().and_then(|active_turn| {
+                active_turn
+                    .task
+                    .as_ref()
+                    .filter(|task| task.turn_context.sub_id == step_context.turn.sub_id)
+                    .map(|_| Arc::clone(&active_turn.turn_state))
+            })
+        };
+        if let Some(turn_state) = turn_state {
+            turn_state.lock().await.last_known_step_context = Some(Arc::clone(step_context));
+        }
+    }
+
+    /// Captures one request-scoped view of dynamic state and retains it for the active turn.
+    ///
+    /// This may refresh filesystem-derived state. Normal turns should call it only from
+    /// `run_turn` and pass the result down; standalone request or history boundaries may capture
+    /// their own step. Use speculative capture for a step that may not execute.
+    pub(crate) async fn capture_step_context(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        cancellation_token: &CancellationToken,
+    ) -> CodexResult<Arc<StepContext>> {
+        self.capture_step_context_with_required_mcp_servers(
+            turn_context,
+            cancellation_token,
+            /*required_servers*/ &[],
+            /*required_plugins*/ &HashSet::new(),
+        )
+        .await
+    }
+
+    /// Captures and retains a step with the required MCP startup dependencies.
+    pub(crate) async fn capture_step_context_with_required_mcp_servers(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        cancellation_token: &CancellationToken,
+        required_servers: &[String],
+        required_plugins: &HashSet<String>,
+    ) -> CodexResult<Arc<StepContext>> {
+        let step_context = self
+            .capture_step_context_inner(
+                turn_context,
+                cancellation_token,
+                required_servers,
+                required_plugins,
+            )
+            .await?;
+        self.set_last_known_step_context(&step_context).await;
+        Ok(step_context)
+    }
+
+    /// Prepares a candidate step without replacing the active turn's retained context.
+    /// The caller must retain it explicitly if it is selected for execution.
+    async fn capture_speculative_step_context(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        cancellation_token: &CancellationToken,
+    ) -> CodexResult<Arc<StepContext>> {
+        self.capture_step_context_inner(
+            turn_context,
+            cancellation_token,
+            /*required_servers*/ &[],
+            /*required_plugins*/ &HashSet::new(),
+        )
+        .await
+    }
+
+    #[tracing::instrument(name = "step_context.capture", level = "info", skip_all)]
+    async fn capture_step_context_inner(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        cancellation_token: &CancellationToken,
+        required_servers: &[String],
+        required_plugins: &HashSet<String>,
+    ) -> CodexResult<Arc<StepContext>> {
+        // Read the step's model and record its environments together so an update cannot split them.
+        // Wait for executor startup below, after releasing the lock.
+        let (mut settings, environments) = {
+            let _active = self
+                .active_turn
+                .lock()
+                .or_cancel(cancellation_token)
+                .await?;
+            (
+                turn_context.next_step_settings.load_full(),
+                self.services.turn_environments.snapshot(),
+            )
+        };
+        if matches!(
+            turn_context.session_source,
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
+        ) {
+            let root_service_tier = self.services.agent_control.service_tier();
+            if settings.selected().service_tier != root_service_tier {
+                let mut selected = settings.selected().clone();
+                selected.service_tier = root_service_tier;
+                let mut inherited_settings = ResolvedStepSettings::new(
+                    Arc::new(selected),
+                    Arc::clone(&settings.model_info),
+                    &self.features,
+                );
+                inherited_settings.mcp_approvals_reviewer_override =
+                    settings.mcp_approvals_reviewer_override;
+                settings = Arc::new(inherited_settings);
+            }
+        }
+        let token_budget = token_budget::resolve_token_budget(
+            turn_context.configured_token_budget.as_ref(),
+            turn_context.use_model_token_budget_defaults,
+            settings.model_info.as_ref(),
+        );
+        let session_telemetry = settings.telemetry(&turn_context.session_telemetry);
+        let environments = environments.or_cancel(cancellation_token).await?;
+        // Keep both preparation futures off caller stacks while they are live together.
+        let load_agents_md = Box::pin(async {
+            let (loaded_agents_md, warnings) = self
+                .services
+                .agents_md_manager
+                .refresh(&turn_context.config, &environments)
+                .or_cancel(cancellation_token)
+                .await?;
+            self.emit_instruction_warnings(warnings).await;
+            loaded_agents_md
+        });
+        let prepare_tools = Box::pin(async {
+            let selected_capability_roots = self
+                .resolve_selected_capability_roots_for_step(&environments)
+                .await;
+            let ready_selected_capability_roots =
+                Self::ready_selected_capability_roots(&selected_capability_roots);
+            let executor_capability_discovery = self
+                .executor_capability_discovery_for_step(
+                    &turn_context.config,
+                    &ready_selected_capability_roots,
+                    &environments,
+                )
+                .await;
+            let extension_data =
+                codex_extension_api::ExtensionData::new(turn_context.sub_id.clone());
+            if let Some(messages) = settings
+                .model_info
+                .model_messages
+                .as_ref()
+                .and_then(|messages| messages.tools.as_ref())
+                .and_then(|tools| tools.multi_agent.as_ref())
+            {
+                extension_data.insert(messages.clone());
+            }
+            extension_data.insert(selected_capability_roots.clone());
+            if let Some(discovery) = &executor_capability_discovery {
+                extension_data.insert(discovery.as_ref().clone());
+            }
+            let (mcp, prepared_recommendations) = tokio::join!(
+                // MCP refresh can be large; keep it off the sampling request's stack.
+                Box::pin(self.mcp_runtime_for_step(
+                    turn_context.as_ref(),
+                    &selected_capability_roots,
+                    required_servers,
+                    required_plugins,
+                )),
+                turn::prepare_tool_recommendations(self.as_ref(), turn_context.as_ref()),
+            );
+            // A step keeps the plugins from the environments it captured, even if shared MCP
+            // moves on to another environment. Its skill tools and the model use this same copy.
+            // Policy follows this step's MCP binding, which may have refreshed mid-turn.
+            let selected_plugins = self
+                .services
+                .mcp_manager
+                .selected_plugins_for_step(
+                    codex_extension_api::McpServerContributionContext::for_step(
+                        turn_context.config.as_ref(),
+                        &self.services.mcp_thread_init,
+                        &self.services.thread_extension_data,
+                        &turn_context.originator,
+                        &ready_selected_capability_roots,
+                        executor_capability_discovery.as_deref(),
+                    )
+                    .with_session_source(&turn_context.session_source)
+                    .with_selected_environments(&environments.all_selections()),
+                    &mcp.config().plugins,
+                    &turn_context.disabled_plugin_ids,
+                )
+                .await;
+            extension_data.insert(selected_plugins);
+            let tool_router = turn::built_tools(
+                self.as_ref(),
+                turn_context.as_ref(),
+                &settings.model_info,
+                &environments,
+                &mcp,
+                &extension_data,
+                prepared_recommendations,
+            )
+            .await?;
+            Ok::<_, CodexErr>((
+                selected_capability_roots,
+                executor_capability_discovery,
+                mcp,
+                tool_router,
+                extension_data,
+            ))
+        });
+        // Returned warnings must finish delivery even if tools fail or preparation is cancelled.
+        let (loaded_agents_md, prepared_tools) =
+            tokio::join!(load_agents_md, prepare_tools.or_cancel(cancellation_token));
+        let loaded_agents_md = loaded_agents_md?;
+        if cancellation_token.is_cancelled() {
+            return Err(CodexErr::TurnAborted);
+        }
+        let (
+            selected_capability_roots,
+            executor_capability_discovery,
+            mcp,
+            tool_router,
+            extension_data,
+        ) = prepared_tools??;
+        Ok(Arc::new(StepContext {
+            preempt: turn_context
+                .config
+                .features
+                .enabled(Feature::InstantInterrupt)
+                .then(CancellationToken::new),
+            realtime: self.conversation.snapshot().await,
+            settings,
+            token_budget,
+            session_telemetry,
+            turn: turn_context,
+            environments,
+            selected_capability_roots,
+            executor_capability_discovery,
+            extension_data,
+            mcp,
+            tool_router,
+            loaded_agents_md,
+        }))
+    }
+
+    pub(crate) async fn record_inter_agent_communication(
+        &self,
+        turn_context: &TurnContext,
+        model_info: &ModelInfo,
+        communication: InterAgentCommunication,
+    ) {
+        let response_item = communication.to_model_input_item();
+        let (items, _) = self
+            .prepare_conversation_items_for_history(
+                turn_context,
+                model_info,
+                std::slice::from_ref(&response_item),
+            )
+            .await;
+        let items = items.as_ref();
+        let mut response_item = ResponseItemEnvelope::new(items[0].clone());
+        // A send confirmed after the pending snapshot must not reach the rollout
+        // before this boundary; older readers assign deliveries by physical order.
+        let boundary = self
+            .code_mode_message_tasks
+            .communication_boundary
+            .acquire()
+            .await
+            .unwrap_or_else(|_| unreachable!("communication boundary remains open"));
+        // Older readers assign delivered assistant messages to the next physical
+        // communication boundary, so persist earlier confirmed sends first.
+        let (order, pending) = {
+            let mut state = self.state.lock().await;
+            (
+                state.history.reserve_input_order(),
+                self.pending_code_mode_message_recordings(),
+            )
+        };
+        response_item
+            .metadata
+            .get_or_insert_default()
+            .user_input_order = Some(order);
+        for mut recording in pending {
+            let _ = recording.changed().await;
+        }
+        {
+            let mut state = self.state.lock().await;
+            state.current_time_reminder.note_recorded_items(items);
+            state.history.record_annotated_items(
+                std::slice::from_mut(&mut response_item),
+                model_info.truncation_policy.into(),
+            );
+        }
+        self.persist_rollout_items(&[
+            RolloutItem::InterAgentCommunicationMetadata {
+                trigger_turn: communication.trigger_turn,
+            },
+            RolloutItem::ResponseItem(response_item),
+        ])
+        .await;
+        drop(boundary);
+        self.send_raw_response_items(turn_context, items).await;
     }
 
     async fn maybe_warn_on_server_model_mismatch(
         self: &Arc<Self>,
-        turn_context: &Arc<TurnContext>,
+        step_context: &StepContext,
         server_model: String,
     ) -> bool {
-        let requested_model = turn_context.model_info.slug.clone();
+        let turn_context = &step_context.turn;
+        let requested_model = step_context.settings.model_info.slug.clone();
         let server_model_normalized = server_model.to_ascii_lowercase();
         let requested_model_normalized = requested_model.to_ascii_lowercase();
         if server_model_normalized == requested_model_normalized {
@@ -2301,11 +4088,31 @@ impl Session {
             }),
         )
         .await;
-        self.record_model_warning(warning_message, turn_context)
-            .await;
         true
     }
 
+    pub(crate) async fn emit_model_verification(
+        self: &Arc<Self>,
+        turn_context: &Arc<TurnContext>,
+        verifications: Vec<ModelVerification>,
+    ) {
+        self.send_event(
+            turn_context,
+            EventMsg::ModelVerification(ModelVerificationEvent { verifications }),
+        )
+        .await;
+    }
+
+    pub(crate) async fn emit_turn_moderation_metadata(
+        self: &Arc<Self>,
+        turn_context: &Arc<TurnContext>,
+        metadata: TurnModerationMetadataEvent,
+    ) {
+        self.send_event(turn_context, EventMsg::TurnModerationMetadata(metadata))
+            .await;
+    }
+
+    #[cfg(test)]
     pub(crate) async fn replace_history(
         &self,
         items: Vec<ResponseItem>,
@@ -2317,29 +4124,112 @@ impl Session {
 
     pub(crate) async fn replace_compacted_history(
         &self,
-        items: Vec<ResponseItem>,
-        reference_context_item: Option<TurnContextItem>,
-        compacted_item: CompactedItem,
+        mut items: Vec<ResponseItemEnvelope>,
+        reference_context_item: TurnContextItem,
+        world_state_baseline: WorldStateSnapshot,
+        metadata: CompactedHistoryMetadata,
     ) {
-        self.replace_history(items, reference_context_item.clone())
-            .await;
-
-        self.persist_rollout_items(&[RolloutItem::Compacted(compacted_item)])
-            .await;
-        if let Some(turn_context_item) = reference_context_item {
-            self.persist_rollout_items(&[RolloutItem::TurnContext(turn_context_item)])
-                .await;
+        for envelope in &mut items {
+            Self::assign_missing_response_item_id(&mut envelope.item);
         }
-        self.services.model_client.advance_window_generation();
-    }
+        let mcp_revision = self
+            .services
+            .executed_tool_calls
+            .mcp_attribution_checkpoint(/*force*/ true)
+            .and_then(|(attribution, revision)| {
+                items.last_mut().map(|envelope| {
+                    envelope.metadata.get_or_insert_default().mcp_attribution = Some(attribution);
+                    revision
+                })
+            });
+        if let Some(checkpoint) = items.iter_mut().rev().find(|envelope| {
+            matches!(
+                envelope.item,
+                ResponseItem::Compaction { .. } | ResponseItem::ContextCompaction { .. }
+            )
+        }) {
+            checkpoint
+                .metadata
+                .get_or_insert_default()
+                .compaction_model_hash = metadata.compaction_model_hash;
+        }
+        // Wait for accepted updates to finish persisting, then keep later updates from
+        // overtaking the current settings snapshot while its checkpoint is written.
+        let _settings_guard = thread_settings::acquire_persistence_lock(self).await;
+        let world_state_item = WorldStateItem::full(world_state_baseline.clone().into_object());
+        let compacted_item = {
+            let mut state = self.state.lock().await;
+            // Goal edits are published outside the running task. Keep edits accepted after
+            // the compaction input snapshot, in their original order, after its replacement.
+            let replacement_goal_ids = crate::context::UserGoalUpdate::message_ids(
+                items.iter().map(|envelope| &envelope.item),
+            );
+            items.extend(
+                state
+                    .history
+                    .annotated_items()
+                    .iter()
+                    .filter(|envelope| {
+                        crate::context::UserGoalUpdate::message_text(&envelope.item).is_some()
+                            && envelope.item.id().is_some_and(|id| {
+                                !metadata.input_goal_ids.contains(id)
+                                    && !replacement_goal_ids.contains(id)
+                            })
+                    })
+                    .cloned(),
+            );
+            let replacement_history = items.clone();
+            state.replace_annotated_history(
+                items,
+                Some(reference_context_item.clone()),
+                HistoryReplacement::Compaction {
+                    reviewer_compaction_hash: metadata.reviewer_compaction_hash,
+                },
+            );
+            state.reasoning_effort_pin = ReasoningEffortPin::Compacted;
+            state.history.set_world_state_baseline(world_state_baseline);
+            CompactedItem {
+                message: metadata.message,
+                replacement_history: Some(replacement_history),
+                guardian_history: state.history.guardian_history_checkpoint(),
+                retained_context: Some(state.history.retained_context().clone()),
+                mcp_resource_origins: self.services.mcp_runtime.resource_origin_checkpoint(),
+                window_number: Some(metadata.window_number),
+                first_window_id: Some(metadata.window_ids.first_window_id.to_string()),
+                previous_window_id: metadata
+                    .window_ids
+                    .previous_window_id
+                    .map(|id| id.to_string()),
+                window_id: Some(metadata.window_ids.window_id.to_string()),
+                compaction_response_id: metadata.compaction_response_id,
+                latest_token_usage_record: state.latest_token_usage_record.clone(),
+                resume_metadata: Some(CompactionResumeMetadata {
+                    multi_agent_version: self.multi_agent_version(),
+                    last_started_turn_id: state.last_started_turn_id.clone(),
+                    turn_attribution: state.turn_attribution.clone(),
+                    previous_turn_settings: state.previous_turn_settings(),
+                }),
+            }
+        };
 
-    async fn persist_rollout_response_items(&self, items: &[ResponseItem]) {
-        let rollout_items: Vec<RolloutItem> = items
-            .iter()
-            .cloned()
-            .map(RolloutItem::ResponseItem)
-            .collect();
-        self.persist_rollout_items(&rollout_items).await;
+        let rollout_items = [
+            RolloutItem::Compacted(compacted_item),
+            RolloutItem::WorldState(world_state_item),
+            RolloutItem::TurnContext(reference_context_item),
+            // The frozen turn context must not override current settings in persisted metadata.
+            RolloutItem::EventMsg(thread_settings::applied_event(self).await),
+        ];
+        if self.persist_rollout_items(&rollout_items).await
+            && let Some(revision) = mcp_revision
+        {
+            self.services
+                .executed_tool_calls
+                .mark_mcp_attribution_persisted(revision);
+        }
+        {
+            let mut state = self.state.lock().await;
+            state.queue_pending_session_start_source(codex_hooks::SessionStartSource::Compact);
+        }
     }
 
     pub fn enabled(&self, feature: Feature) -> bool {
@@ -2352,9 +4242,39 @@ impl Session {
 
     pub(crate) async fn collaboration_mode(&self) -> CollaborationMode {
         let state = self.state.lock().await;
-        state.session_configuration.collaboration_mode.clone()
+        state
+            .session_configuration
+            .step_settings
+            .collaboration_mode
+            .clone()
     }
 
+    pub(crate) fn multi_agent_version(&self) -> Option<MultiAgentVersion> {
+        self.multi_agent_version.get().copied()
+    }
+
+    pub(crate) fn set_multi_agent_version_if_unset(
+        &self,
+        multi_agent_version: MultiAgentVersion,
+    ) -> MultiAgentVersion {
+        *self.multi_agent_version.get_or_init(|| multi_agent_version)
+    }
+
+    pub(crate) fn resolve_multi_agent_version_for_model(
+        &self,
+        model_info: &ModelInfo,
+        config: &Config,
+    ) -> MultiAgentVersion {
+        if let Some(multi_agent_version) = self.multi_agent_version() {
+            return config.multi_agent_version_for_model(Some(multi_agent_version));
+        }
+
+        let selected = config.multi_agent_version_for_model(model_info.multi_agent_version);
+
+        self.set_multi_agent_version_if_unset(selected)
+    }
+
+    #[tracing::instrument(level = "trace", skip_all, fields(item_count = items.len()))]
     async fn send_raw_response_items(&self, turn_context: &TurnContext, items: &[ResponseItem]) {
         for item in items {
             self.send_event(
@@ -2365,225 +4285,432 @@ impl Session {
         }
     }
 
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "MCP app context rendering reads through the session-owned manager guard"
-    )]
-    pub(crate) async fn build_initial_context(
+    async fn build_turn_context_contribution_items(
         &self,
-        turn_context: &TurnContext,
+        step_context: &StepContext,
     ) -> Vec<ResponseItem> {
-        let mut developer_sections = Vec::<String>::with_capacity(8);
-        let mut contextual_user_sections = Vec::<String>::with_capacity(2);
-        let shell = self.user_shell();
-        let (
-            reference_context_item,
-            previous_turn_settings,
-            collaboration_mode,
-            base_instructions,
-            session_source,
-        ) = {
+        let turn_context = step_context.turn.as_ref();
+        let mut developer_sections = Vec::new();
+        let context_contributors = self.services.extensions.context_contributors().to_vec();
+
+        for contributor in &context_contributors {
+            for fragment in contributor
+                .contribute_turn_context(TurnContextContributionInput {
+                    thread_id: self.thread_id(),
+                    turn_id: turn_context.sub_id.as_str(),
+                    session_store: &self.services.session_extension_data,
+                    thread_store: &self.services.thread_extension_data,
+                    turn_store: turn_context.extension_data.as_ref(),
+                    model_context_window: step_context.settings.model_info.usable_context_window(),
+                })
+                .await
+            {
+                developer_sections.push(fragment.into());
+            }
+        }
+
+        crate::context_manager::updates::build_rendered_message(developer_sections)
+            .into_iter()
+            .collect()
+    }
+
+    /// `step_context` and `world_state` must come from the same captured step.
+    /// Returns rendered items with placement preserved for the caller's history layout.
+    pub(crate) async fn build_initial_context_with_world_state(
+        &self,
+        step_context: &StepContext,
+        world_state: &WorldState,
+    ) -> (Vec<WorldStateUpdate>, WorldStateSnapshot) {
+        let turn_context = step_context.turn.as_ref();
+        let mut developer_sections = Vec::<RenderedFragment>::with_capacity(8);
+        let mut contextual_user_sections = Vec::<RenderedFragment>::with_capacity(2);
+        let mut separate_developer_sections = Vec::<RenderedFragment>::new();
+        let mut context_window_hints = Vec::new();
+        let (session_source, auto_compact_window_ids) = {
             let state = self.state.lock().await;
             (
-                state.reference_context_item(),
-                state.previous_turn_settings(),
-                state.session_configuration.collaboration_mode.clone(),
-                state.session_configuration.base_instructions.clone(),
                 state.session_configuration.session_source.clone(),
+                state.auto_compact_window_ids(),
             )
         };
-        if let Some(model_switch_message) =
-            crate::context_manager::updates::build_model_instructions_update_item(
-                previous_turn_settings.as_ref(),
-                turn_context,
-            )
-        {
-            developer_sections.push(model_switch_message.into_text());
-        }
-        if turn_context.config.include_permissions_instructions {
-            developer_sections.push(
-                DeveloperInstructions::from_policy(
-                    turn_context.sandbox_policy.get(),
-                    turn_context.approval_policy.value(),
-                    turn_context.config.approvals_reviewer,
-                    self.services.exec_policy.current().as_ref(),
-                    &turn_context.cwd,
-                    turn_context
-                        .features
-                        .enabled(Feature::ExecPermissionApprovals),
-                    turn_context
-                        .features
-                        .enabled(Feature::RequestPermissionsTool),
-                )
-                .into_text(),
-            );
-        }
         let separate_guardian_developer_message =
-            crate::guardian::is_guardian_reviewer_source(&session_source);
+            crate::guardian::is_basic_session_source(&session_source);
         // Keep the guardian policy prompt out of the aggregated developer bundle so it
         // stays isolated as its own top-level developer message for guardian subagents.
         if !separate_guardian_developer_message
             && let Some(developer_instructions) = turn_context.developer_instructions.as_deref()
             && !developer_instructions.is_empty()
         {
-            developer_sections.push(developer_instructions.to_string());
-        }
-        // Add developer instructions for memories.
-        if turn_context.features.enabled(Feature::MemoryTool)
-            && turn_context.config.memories.use_memories
-            && let Some(memory_prompt) =
-                build_memory_tool_developer_instructions(&turn_context.config.codex_home).await
-        {
-            developer_sections.push(memory_prompt);
-        }
-        // Add developer instructions from collaboration_mode if they exist and are non-empty
-        if let Some(collab_instructions) =
-            DeveloperInstructions::from_collaboration_mode(&collaboration_mode)
-        {
-            developer_sections.push(collab_instructions.into_text());
-        }
-        if let Some(realtime_update) = crate::context_manager::updates::build_initial_realtime_item(
-            reference_context_item.as_ref(),
-            previous_turn_settings.as_ref(),
-            turn_context,
-        ) {
-            developer_sections.push(realtime_update.into_text());
-        }
-        if self.features.enabled(Feature::Personality)
-            && let Some(personality) = turn_context.personality
-        {
-            let model_info = turn_context.model_info.clone();
-            let has_baked_personality = model_info.supports_personality()
-                && base_instructions == model_info.get_model_instructions(Some(personality));
-            if !has_baked_personality
-                && let Some(personality_message) =
-                    crate::context_manager::updates::personality_message_for(
-                        &model_info,
-                        personality,
-                    )
-            {
-                developer_sections.push(
-                    DeveloperInstructions::personality_spec_message(personality_message)
-                        .into_text(),
-                );
-            }
-        }
-        if turn_context.config.include_apps_instructions && turn_context.apps_enabled() {
-            let mcp_connection_manager = self.services.mcp_connection_manager.read().await;
-            let accessible_and_enabled_connectors =
-                connectors::list_accessible_and_enabled_connectors_from_manager(
-                    &mcp_connection_manager,
-                    &turn_context.config,
-                )
-                .await;
-            if let Some(apps_section) = render_apps_section(&accessible_and_enabled_connectors) {
-                developer_sections.push(apps_section);
-            }
-        }
-        if turn_context.config.include_skill_instructions {
-            let implicit_skills = turn_context
-                .turn_skills
-                .outcome
-                .allowed_skills_for_implicit_invocation();
-            let rendered_skills = render_skills_section(
-                &implicit_skills,
-                default_skill_metadata_budget(turn_context.model_info.context_window),
-                SkillRenderSideEffects::ThreadStart {
-                    session_telemetry: &self.services.session_telemetry,
-                },
-            );
-            if let Some(rendered_skills) = rendered_skills {
-                if rendered_skills.emit_warning {
-                    self.send_event_raw(Event {
-                        id: String::new(),
-                        msg: EventMsg::Warning(WarningEvent {
-                            message: THREAD_START_SKILLS_TRIMMED_WARNING_MESSAGE.to_string(),
-                        }),
-                    })
-                    .await;
-                }
-                developer_sections.push(rendered_skills.text);
-            }
+            developer_sections
+                .push(DeveloperInstructions::new(developer_instructions).render_fragment());
         }
         let loaded_plugins = self
             .services
             .plugins_manager
-            .plugins_for_config(&turn_context.config)
-            .await;
-        if let Some(plugin_section) = render_plugins_section(loaded_plugins.capability_summaries())
+            .plugins_for_config(&turn_context.config.plugins_config_input())
+            .await
+            .without_plugins(&turn_context.disabled_plugin_ids);
+        let recommended_plugin_candidates = if turn_context
+            .config
+            .features
+            .plugin_recommendations_enabled()
         {
-            developer_sections.push(plugin_section);
-        }
-        if turn_context.features.enabled(Feature::CodexGitCommit)
-            && let Some(commit_message_instruction) = commit_message_trailer_instruction(
-                turn_context.config.commit_attribution.as_deref(),
-            )
-        {
-            developer_sections.push(commit_message_instruction);
-        }
-        if let Some(user_instructions) = turn_context.user_instructions.as_deref() {
-            contextual_user_sections.push(
-                UserInstructions {
-                    text: user_instructions.to_string(),
-                    directory: turn_context.cwd.to_string_lossy().into_owned(),
+            let auth = self.services.auth_manager.auth().await;
+            let plugins_config = turn_context.config.plugins_config_input();
+            self.services
+                .plugins_manager
+                .recommended_plugin_candidates_for_config(RecommendedPluginCandidatesInput {
+                    plugins_config: &plugins_config,
+                    loaded_plugins: &loaded_plugins,
+                    auth: auth.as_ref(),
+                    disabled_tools: &turn_context.config.tool_suggest.disabled_tools,
+                    app_server_client_name: turn_context.app_server_client_name.as_deref(),
+                })
+                .await
+        } else {
+            None
+        };
+        let context_contributors = self.services.extensions.context_contributors().to_vec();
+        for contributor in &context_contributors {
+            for fragment in contributor
+                .contribute_thread_context(
+                    &self.services.session_extension_data,
+                    &self.services.thread_extension_data,
+                )
+                .await
+            {
+                match fragment.slot() {
+                    PromptSlot::ContextWindow => {
+                        context_window_hints.push(fragment.text().to_string());
+                    }
+                    PromptSlot::DeveloperPolicy | PromptSlot::DeveloperCapabilities => {
+                        developer_sections.push(fragment.into());
+                    }
                 }
-                .render(),
+            }
+        }
+        for contributor in &context_contributors {
+            for fragment in contributor
+                .contribute_turn_context(TurnContextContributionInput {
+                    thread_id: self.thread_id(),
+                    turn_id: turn_context.sub_id.as_str(),
+                    session_store: &self.services.session_extension_data,
+                    thread_store: &self.services.thread_extension_data,
+                    turn_store: turn_context.extension_data.as_ref(),
+                    model_context_window: step_context.settings.model_info.usable_context_window(),
+                })
+                .await
+            {
+                developer_sections.push(fragment.into());
+            }
+        }
+        // This is full-context metadata. Steady-state context diffs should not re-emit it.
+        if turn_context.config.features.enabled(Feature::TokenBudget)
+            && step_context
+                .settings
+                .model_info
+                .resolved_context_window()
+                .is_some()
+        {
+            // Keep the legacy bridge hint when native Notes is disabled. A failed
+            // native request must not fall back to the bridge.
+            if !turn_context
+                .config
+                .token_budget
+                .as_ref()
+                .is_some_and(|config| config.use_history_notes_extension)
+                && let Some(mcp_result) = self
+                    .services
+                    .mcp_runtime
+                    .latest_call_tool(
+                        "notes",
+                        "thread_hint",
+                        /*environment_id*/ None,
+                        /*arguments*/ None,
+                        Some(serde_json::json!({
+                            "threadId": self.thread_id().to_string(),
+                        })),
+                        /*requested_timeout*/ None,
+                        /*wait_for_server*/ true,
+                    )
+                    .await
+                    .ok()
+                    .and_then(|result| {
+                        let text = result
+                            .content
+                            .iter()
+                            .filter_map(|content| {
+                                content.get("text").and_then(serde_json::Value::as_str)
+                            })
+                            .filter(|text| !text.is_empty())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        (!text.is_empty()).then_some(text)
+                    })
+            {
+                context_window_hints.push(mcp_result);
+            }
+            separate_developer_sections.push(
+                crate::context::TokenBudgetContext::new(
+                    session_source
+                        .get_agent_path()
+                        .unwrap_or_else(codex_protocol::AgentPath::root),
+                    auto_compact_window_ids.first_window_id,
+                    auto_compact_window_ids.previous_window_id,
+                    auto_compact_window_ids.window_id,
+                    (!context_window_hints.is_empty()).then(|| context_window_hints.join("\n")),
+                )
+                .render_fragment(),
             );
         }
-        if turn_context.config.include_environment_context {
-            let subagents = self
-                .services
-                .agent_control
-                .format_environment_context_subagents(self.conversation_id)
-                .await;
-            contextual_user_sections.push(
-                crate::context::EnvironmentContext::from_turn_context(turn_context, shell.as_ref())
-                    .with_subagents(subagents)
-                    .render(),
-            );
-        }
+        let (snapshot, updates) = world_state.render_full();
+        let (mut prefix, context) = split_prefix_updates(updates);
+        let mut items = Vec::with_capacity(4);
+        let mut context = context.into_iter();
+        // Keep the initial-context grouping within each fragment run, but never across an item.
+        loop {
+            let mut next_item = None;
+            // Render the active mode after the usage hint so it can override that hint.
+            let mut initial_multi_agent_mode = None;
+            let mut managed_developer_instructions = None;
+            for update in context.by_ref() {
+                let fragment = match update.content {
+                    WorldStateUpdateContent::Fragment(fragment) => fragment,
+                    WorldStateUpdateContent::Item(item) => {
+                        next_item = Some(*item);
+                        break;
+                    }
+                };
+                match fragment.role() {
+                    "developer"
+                        if fragment.markers().0 == ModelSwitchInstructions::type_markers().0 =>
+                    {
+                        // New-model instructions must precede the rest of the developer context.
+                        developer_sections.insert(0, fragment.render_fragment());
+                    }
+                    "developer" if fragment.markers().0 == MULTI_AGENT_MODE_OPEN_TAG => {
+                        initial_multi_agent_mode = Some(fragment);
+                    }
+                    "developer"
+                        if fragment.markers().0
+                            == ManagedDeveloperInstructions::type_markers().0 =>
+                    {
+                        managed_developer_instructions = Some(fragment);
+                    }
+                    "developer"
+                        if fragment.markers().0 == MultiAgentRoleInstructions::type_markers().0 =>
+                    {
+                        separate_developer_sections.push(fragment.render_fragment());
+                    }
+                    "developer"
+                        if update.placement == Placement::Standalone
+                            && fragment.markers().0.is_empty() =>
+                    {
+                        separate_developer_sections.push(fragment.render_fragment());
+                    }
+                    "developer" => developer_sections.push(fragment.render_fragment()),
+                    "user" => contextual_user_sections.push(fragment.render_fragment()),
+                    _ => {}
+                }
+            }
 
-        let mut items = Vec::with_capacity(3);
-        if let Some(developer_message) =
-            crate::context_manager::updates::build_developer_update_item(developer_sections)
-        {
-            items.push(developer_message);
+            if next_item.is_none()
+                && let Some(recommended_plugins) = recommended_plugin_candidates
+                    .as_deref()
+                    .and_then(RecommendedPluginsInstructions::from_plugins)
+            {
+                developer_sections.push(recommended_plugins.render_fragment());
+            }
+
+            if let Some(developer_message) = crate::context_manager::updates::build_rendered_message(
+                std::mem::take(&mut developer_sections),
+            ) {
+                items.push(developer_message);
+            }
+            for section in separate_developer_sections.drain(..) {
+                if let Some(developer_message) =
+                    crate::context_manager::updates::build_rendered_message(vec![section])
+                {
+                    items.push(developer_message);
+                }
+            }
+            if let Some(initial_multi_agent_mode) = initial_multi_agent_mode
+                && let Some(message) =
+                    crate::context_manager::updates::build_rendered_message(vec![
+                        initial_multi_agent_mode.render_fragment(),
+                    ])
+            {
+                items.push(message);
+            }
+            if let Some(contextual_user_message) =
+                crate::context_manager::updates::build_rendered_message(std::mem::take(
+                    &mut contextual_user_sections,
+                ))
+            {
+                items.push(contextual_user_message);
+            }
+            // Emit the guardian policy prompt as a separate developer item so the guardian
+            // subagent sees a distinct, easy-to-audit instruction block.
+            if next_item.is_none()
+                && separate_guardian_developer_message
+                && let Some(developer_instructions) = turn_context.developer_instructions.as_deref()
+                && !developer_instructions.is_empty()
+                && let Some(guardian_developer_message) =
+                    crate::context_manager::updates::build_rendered_message(vec![
+                        GuardianPolicy::new(developer_instructions).render_fragment(),
+                    ])
+            {
+                items.push(guardian_developer_message);
+            }
+            if let Some(managed_developer_instructions) = managed_developer_instructions
+                && let Some(message) =
+                    crate::context_manager::updates::build_rendered_message(vec![
+                        managed_developer_instructions.render_fragment(),
+                    ])
+            {
+                items.push(message);
+            }
+
+            if let Some(item) = next_item {
+                items.push(item);
+            } else {
+                break;
+            }
         }
-        if let Some(contextual_user_message) =
-            crate::context_manager::updates::build_contextual_user_message(contextual_user_sections)
-        {
-            items.push(contextual_user_message);
+        // New context windows and compaction install these items directly into replacement history.
+        for item in prefix.iter_mut().chain(&mut items) {
+            item.set_turn_id_if_missing(&turn_context.sub_id);
         }
-        // Emit the guardian policy prompt as a separate developer item so the guardian
-        // subagent sees a distinct, easy-to-audit instruction block.
-        if separate_guardian_developer_message
-            && let Some(developer_instructions) = turn_context.developer_instructions.as_deref()
-            && !developer_instructions.is_empty()
-            && let Some(guardian_developer_message) =
-                crate::context_manager::updates::build_developer_update_item(vec![
-                    developer_instructions.to_string(),
-                ])
-        {
-            items.push(guardian_developer_message);
-        }
-        items
+        let updates = prefix
+            .into_iter()
+            .map(WorldStateUpdate::prefix_item)
+            .chain(items.into_iter().map(|item| WorldStateUpdate {
+                placement: Placement::Standalone,
+                content: WorldStateUpdateContent::Item(Box::new(item)),
+            }))
+            .collect();
+        (updates, snapshot)
     }
 
-    pub(crate) async fn persist_rollout_items(&self, items: &[RolloutItem]) {
-        let recorder = {
-            let guard = self.services.rollout.lock().await;
-            guard.clone()
-        };
-        if let Some(rec) = recorder
-            && let Err(e) = rec.record_items(items).await
+    #[tracing::instrument(level = "trace", skip_all, fields(item_count = items.len()))]
+    pub(crate) async fn persist_rollout_items(&self, items: &[RolloutItem]) -> bool {
+        if let Some(live_thread) = self.live_thread()
+            && let Err(e) = live_thread.append_items(items).await
         {
             error!("failed to record rollout items: {e:#}");
+            return false;
         }
+        true
     }
 
     pub(crate) async fn clone_history(&self) -> ContextManager {
         let state = self.state.lock().await;
         state.clone_history()
+    }
+
+    /// Captures the history lifetime without exposing mutable session state.
+    pub(crate) async fn history_reset(&self) -> (u64, CancellationToken) {
+        let state = self.state.lock().await;
+        (
+            state.history.reset_version,
+            state.history_reset.child_token(),
+        )
+    }
+
+    pub(crate) async fn conversation_history_snapshot(
+        &self,
+    ) -> Arc<dyn ConversationHistorySnapshot> {
+        let state = self.state.lock().await;
+        state.history.conversation_history_snapshot()
+    }
+
+    pub(crate) async fn current_window_id(&self) -> String {
+        self.current_window().await.0
+    }
+
+    pub(crate) async fn current_window(&self) -> (String, u64, Uuid) {
+        let state = self.state.lock().await;
+        let thread_id = self.thread_id;
+        let window_number = state.auto_compact_window_number();
+        let context_window_id = state.auto_compact_window_ids().window_id;
+        (
+            format!("{thread_id}:{window_number}"),
+            window_number,
+            context_window_id,
+        )
+    }
+
+    pub(crate) async fn advance_auto_compact_window(&self) -> (u64, AutoCompactWindowIds) {
+        let mut state = self.state.lock().await;
+        state.advance_auto_compact_window()
+    }
+
+    pub(crate) async fn request_new_context_window(&self) {
+        let mut state = self.state.lock().await;
+        state.request_new_context_window();
+    }
+
+    pub(crate) async fn take_new_context_window_request(&self) -> bool {
+        let mut state = self.state.lock().await;
+        state.take_new_context_window_request()
+    }
+
+    pub(crate) async fn start_new_context_window(
+        &self,
+        step_context: &StepContext,
+        world_state: Arc<WorldState>,
+    ) {
+        let turn_context = step_context.turn.as_ref();
+        let history = self.clone_history().await;
+        let input_goal_ids = crate::context::UserGoalUpdate::message_ids(history.raw_items());
+        let retained_client_items =
+            crate::compact_remote_v2::truncate_retained_messages_for_remote_compaction(
+                history
+                    .annotated_items()
+                    .iter()
+                    .filter(|item| {
+                        (self.enabled(Feature::RetainClientToolOutputs)
+                            && crate::compact_retained_tool_outputs::is_retained_tool_output(item))
+                            || (self.enabled(Feature::RetainClientDeveloperMessages)
+                                && crate::compact_remote_v2::is_client_authored_developer_message(
+                                    item,
+                                ))
+                    })
+                    .cloned()
+                    .collect(),
+                crate::compact_remote_v2::RETAINED_MESSAGE_TOKEN_BUDGET,
+            );
+        let window = {
+            let mut state = self.state.lock().await;
+            state.start_new_context_window()
+        };
+        let (window_number, window_ids) = window;
+        let (context_updates, world_state_snapshot) = self
+            .build_initial_context_with_world_state(step_context, world_state.as_ref())
+            .await;
+        let context_items =
+            crate::context_manager::updates::merge_world_state_updates(context_updates)
+                .into_iter()
+                .map(ResponseItemEnvelope::new)
+                .chain(retained_client_items)
+                .collect();
+        let turn_context_item = step_context.to_turn_context_item();
+        self.replace_compacted_history(
+            context_items,
+            turn_context_item,
+            world_state_snapshot,
+            CompactedHistoryMetadata {
+                input_goal_ids,
+                message: String::new(),
+                window_number,
+                window_ids,
+                compaction_response_id: None,
+                compaction_model_hash: None,
+                reviewer_compaction_hash: None,
+            },
+        )
+        .await;
+        self.recompute_token_usage(turn_context).await;
     }
 
     pub(crate) async fn reference_context_item(&self) -> Option<TurnContextItem> {
@@ -2595,57 +4722,203 @@ impl Session {
     /// steady-state turns that emit model-visible context updates.
     ///
     /// When the reference snapshot is missing, this injects full initial context. Otherwise, it
-    /// emits only settings diff items.
+    /// emits only context diffs.
     ///
     /// If full context is injected and a model switch occurred, this prepends the
     /// `<model_switch>` developer message so model-specific instructions are not lost.
     ///
     /// This is the normal runtime path that establishes a new `reference_context_item`.
-    /// Mid-turn compaction is the other path that can re-establish that baseline when it
-    /// reinjects full initial context into replacement history. Other non-regular tasks
-    /// intentionally do not update the baseline.
+    /// Compaction also establishes that reference when it installs full initial context
+    /// into replacement history. Live world-state changes may
+    /// independently advance their in-memory baseline within a turn.
+    #[instrument(level = "trace", skip_all)]
     pub(crate) async fn record_context_updates_and_set_reference_context_item(
         &self,
-        turn_context: &TurnContext,
-    ) {
+        step_context: &StepContext,
+    ) -> CodexResult<()> {
+        let turn_context = step_context.turn.as_ref();
         let reference_context_item = {
             let state = self.state.lock().await;
             state.reference_context_item()
         };
+        let turn_context_item = step_context.to_turn_context_item();
+        let turn_context_changed = reference_context_item.as_ref() != Some(&turn_context_item);
         let should_inject_full_context = reference_context_item.is_none();
-        let context_items = if should_inject_full_context {
-            self.build_initial_context(turn_context).await
-        } else {
-            // Steady-state path: append only context diffs to minimize token overhead.
-            self.build_settings_update_items(reference_context_item.as_ref(), turn_context)
-                .await
-        };
-        let turn_context_item = turn_context.to_turn_context_item();
-        if !context_items.is_empty() {
-            self.record_conversation_items(turn_context, &context_items)
+        let world_state = self
+            .build_world_state_for_step(step_context, should_inject_full_context)
+            .await?;
+        // Full initial context resets the baseline; later turns persist only its changes.
+        let (mut context_items, world_state_item) = if should_inject_full_context {
+            let (context_updates, snapshot) = self
+                .build_initial_context_with_world_state(step_context, &world_state)
                 .await;
+            let context_items =
+                crate::context_manager::updates::merge_world_state_updates(context_updates);
+            self.state
+                .lock()
+                .await
+                .history
+                .set_world_state_baseline(snapshot.clone());
+            (
+                context_items,
+                Some(WorldStateItem::full(snapshot.into_object())),
+            )
+        } else {
+            let (world_state_items, world_state_item) = {
+                let mut state = self.state.lock().await;
+                let (fragments, rollout_item) = state.history.update_world_state(&world_state);
+                (
+                    crate::context_manager::updates::merge_world_state_updates(fragments),
+                    rollout_item,
+                )
+            };
+            (world_state_items, world_state_item)
+        };
+        if !should_inject_full_context && turn_context_changed {
+            context_items.extend(
+                self.build_turn_context_contribution_items(step_context)
+                    .await,
+            );
+        }
+        // A snapshot can change without producing model-visible or TurnContext updates.
+        let only_world_state_changed = !turn_context_changed && context_items.is_empty();
+        if only_world_state_changed && world_state_item.is_none() {
+            return Ok(());
+        }
+        if !context_items.is_empty() {
+            self.record_conversation_items(
+                turn_context,
+                &step_context.settings.model_info,
+                &context_items,
+            )
+            .await;
+        }
+        // Persist state only after any model-visible context generated from it.
+        if let Some(world_state_item) = world_state_item {
+            self.persist_rollout_items(&[RolloutItem::WorldState(world_state_item)])
+                .await;
+        }
+        // A snapshot-only change does not require a duplicate TurnContext record.
+        if only_world_state_changed {
+            return Ok(());
         }
         // Persist one `TurnContextItem` per real user turn so resume/lazy replay can recover the
         // latest durable baseline even when this turn emitted no model-visible context diffs.
-        self.persist_rollout_items(&[RolloutItem::TurnContext(turn_context_item.clone())])
-            .await;
+        // Checkpoint current thread-owned settings after the first turn's context:
+        // the step may predate an acknowledged update or use executor-owned permissions.
+        // Serialize with settings updates so an older checkpoint cannot supersede a newer one.
+        let _settings_guard = if should_inject_full_context {
+            Some(thread_settings::acquire_persistence_lock(self).await)
+        } else {
+            None
+        };
+        let mut rollout_items = vec![RolloutItem::TurnContext(turn_context_item.clone())];
+        if should_inject_full_context {
+            rollout_items.push(RolloutItem::EventMsg(
+                thread_settings::applied_event(self).await,
+            ));
+        }
+        self.persist_rollout_items(&rollout_items).await;
 
-        // Advance the in-memory diff baseline even when this turn emitted no model-visible
-        // context items. This keeps later runtime diffing aligned with the current turn state.
+        // Advance the persisted-settings baseline even when this turn emitted no model-visible
+        // context items.
         let mut state = self.state.lock().await;
         state.set_reference_context_item(Some(turn_context_item));
+        Ok(())
     }
 
     pub(crate) async fn update_token_usage_info(
         &self,
         turn_context: &TurnContext,
         token_usage: Option<&TokenUsage>,
-    ) {
-        if let Some(token_usage) = token_usage {
-            let mut state = self.state.lock().await;
-            state.update_token_info_from_usage(token_usage, turn_context.model_context_window());
-        }
+    ) -> CodexResult<()> {
+        let result = self
+            .record_token_usage_info(turn_context, &turn_context.initial_settings, token_usage)
+            .await;
         self.send_token_count_event(turn_context).await;
+        result
+    }
+
+    pub(crate) async fn record_observed_response_completed(
+        &self,
+        turn_context: &TurnContext,
+        response_id: &str,
+        usage: Option<&TokenUsage>,
+        usage_metadata: Option<&ResponseUsageMetadata>,
+    ) {
+        self.send_event(
+            turn_context,
+            EventMsg::RawResponseCompleted(RawResponseCompletedEvent {
+                response_id: response_id.to_string(),
+                token_usage: usage.cloned(),
+                usage_metadata: usage_metadata.cloned(),
+            }),
+        )
+        .await;
+        let Some(usage) = usage else {
+            return;
+        };
+        let record = self.state.lock().await.record_token_usage(
+            self.thread_id,
+            &turn_context.sub_id,
+            self.session_id(),
+            turn_context
+                .turn_metadata_state
+                .root_turn_id()
+                .unwrap_or_else(|| turn_context.sub_id.clone()),
+            response_id.to_string(),
+            usage,
+        );
+        self.persist_rollout_items(&[RolloutItem::TokenUsageRecord(record)])
+            .await;
+    }
+
+    pub(crate) async fn record_token_usage_info(
+        &self,
+        turn_context: &TurnContext,
+        settings: &ResolvedStepSettings,
+        token_usage: Option<&TokenUsage>,
+    ) -> CodexResult<()> {
+        if let Some(token_usage) = token_usage {
+            let token_info = {
+                let mut state = self.state.lock().await;
+                state
+                    .update_token_info_from_usage(token_usage, turn_context.model_context_window());
+                if matches!(
+                    turn_context.config.model_auto_compact_token_limit_scope,
+                    AutoCompactTokenLimitScope::BodyAfterPrefix
+                ) {
+                    state.ensure_auto_compact_window_server_prefill_from_usage(token_usage);
+                }
+                state.token_info()
+            };
+            let turn_state = self
+                .input_queue
+                .turn_state_for_sub_id(&self.active_turn, &turn_context.sub_id)
+                .await;
+            if let Some(turn_state) = turn_state {
+                turn_state.lock().await.token_usage_by_model.record(
+                    settings.selected_collaboration_mode().model(),
+                    settings.telemetry(&turn_context.session_telemetry),
+                    token_usage,
+                );
+            }
+            let budget_result = self.record_rollout_budget_usage(token_usage).await;
+            if let Some(token_info) = token_info.as_ref() {
+                for contributor in self.services.extensions.token_usage_contributors() {
+                    contributor
+                        .on_token_usage(
+                            &self.services.session_extension_data,
+                            &self.services.thread_extension_data,
+                            turn_context.extension_data.as_ref(),
+                            token_info,
+                        )
+                        .await;
+                }
+            }
+            budget_result?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn recompute_token_usage(&self, turn_context: &TurnContext) {
@@ -2667,9 +4940,11 @@ impl Session {
             info.last_token_usage = TokenUsage {
                 input_tokens: 0,
                 cached_input_tokens: 0,
+                cache_write_input_tokens: 0,
                 output_tokens: 0,
                 reasoning_output_tokens: 0,
                 total_tokens: estimated_total_tokens.max(0),
+                codex_rollout_budget_units: None,
             };
 
             if let Some(model_context_window) = turn_context.model_context_window() {
@@ -2678,6 +4953,11 @@ impl Session {
 
             state.set_token_info(Some(info));
         }
+        self.set_auto_compact_window_estimated_prefill_for_scope(
+            turn_context,
+            estimated_total_tokens,
+        )
+        .await;
         self.send_token_count_event(turn_context).await;
     }
 
@@ -2686,11 +4966,15 @@ impl Session {
         turn_context: &TurnContext,
         new_rate_limits: RateLimitSnapshot,
     ) {
+        self.record_rate_limits_info(new_rate_limits).await;
+        self.send_token_count_event(turn_context).await;
+    }
+
+    pub(crate) async fn record_rate_limits_info(&self, new_rate_limits: RateLimitSnapshot) {
         {
             let mut state = self.state.lock().await;
             state.set_rate_limits(new_rate_limits);
         }
-        self.send_token_count_event(turn_context).await;
     }
 
     pub(crate) async fn mcp_dependency_prompted(&self) -> HashSet<String> {
@@ -2706,22 +4990,12 @@ impl Session {
         state.record_mcp_dependency_prompted(names);
     }
 
-    pub async fn dependency_env(&self) -> HashMap<String, String> {
-        let state = self.state.lock().await;
-        state.dependency_env()
-    }
-
-    pub async fn set_dependency_env(&self, values: HashMap<String, String>) {
-        let mut state = self.state.lock().await;
-        state.set_dependency_env(values);
-    }
-
     pub(crate) async fn set_server_reasoning_included(&self, included: bool) {
         let mut state = self.state.lock().await;
         state.set_server_reasoning_included(included);
     }
 
-    async fn send_token_count_event(&self, turn_context: &TurnContext) {
+    pub(crate) async fn send_token_count_event(&self, turn_context: &TurnContext) {
         let (info, rate_limits) = {
             let state = self.state.lock().await;
             state.token_info_and_rate_limits()
@@ -2741,11 +5015,16 @@ impl Session {
     pub(crate) async fn record_response_item_and_emit_turn_item(
         &self,
         turn_context: &TurnContext,
+        model_info: &ModelInfo,
         response_item: ResponseItem,
     ) {
         // Add to conversation history and persist response item to rollout.
-        self.record_conversation_items(turn_context, std::slice::from_ref(&response_item))
-            .await;
+        self.record_conversation_items(
+            turn_context,
+            model_info,
+            std::slice::from_ref(&response_item),
+        )
+        .await;
 
         // Derive a turn item and emit lifecycle events if applicable.
         if let Some(item) = parse_turn_item(&response_item) {
@@ -2757,29 +5036,63 @@ impl Session {
     pub(crate) async fn record_user_prompt_and_emit_turn_item(
         &self,
         turn_context: &TurnContext,
+        model_info: &ModelInfo,
         input: &[UserInput],
-        response_item: ResponseItem,
+        client_id: Option<String>,
+        metadata: UserInputMetadata,
+        persist_context: PersistContext,
     ) {
         // Persist the user message to history, but emit the turn item from `UserInput` so
         // UI-only `text_elements` are preserved. `ResponseItem::Message` does not carry
         // those spans, and `record_response_item_and_emit_turn_item` would drop them.
-        self.record_conversation_items(turn_context, std::slice::from_ref(&response_item))
+        let mut user_image_content_indices = HashMap::new();
+        let mut response_item = self.response_item_from_user_input_with_image_positions(
+            input.to_vec(),
+            &mut user_image_content_indices,
+        );
+        if metadata.origin == codex_history::UserInputOrigin::Heartbeat
+            && let ResponseItem::Message {
+                content,
+                internal_chat_message_metadata_passthrough: Some(metadata),
+                ..
+            } = &mut response_item
+            && matches!(content.as_slice(), [ContentItem::InputText { .. }])
+        {
+            metadata.content_item_kinds = Some(vec![ContentItemKind(
+                codex_history::HEARTBEAT_CONTENT_KIND.to_owned(),
+            )]);
+        }
+        let (prepared_items, image_preparations) = self
+            .prepare_annotated_conversation_items_for_history(
+                turn_context,
+                model_info,
+                vec![ResponseItemEnvelope {
+                    item: response_item,
+                    metadata: metadata.acceptance_order.map(|order| CodexHarnessMetadata {
+                        user_input_order: Some(order),
+                        ..Default::default()
+                    }),
+                }],
+            )
             .await;
-        let turn_item = TurnItem::UserMessage(UserMessageItem::new(input));
+        let mut user_message_item = UserMessageItem::new(input);
+        apply_prepared_image_file_ids(
+            &mut user_message_item,
+            &prepared_items,
+            &user_image_content_indices,
+        );
+        self.record_prepared_conversation_items(
+            turn_context,
+            model_info,
+            prepared_items,
+            image_preparations,
+        )
+        .await;
+        user_message_item.client_id = client_id;
+        let turn_item = TurnItem::UserMessage(user_message_item);
         self.emit_turn_item_started(turn_context, &turn_item).await;
         self.emit_turn_item_completed(turn_context, turn_item).await;
-        self.ensure_rollout_materialized().await;
-    }
-
-    pub(crate) async fn notify_background_event(
-        &self,
-        turn_context: &TurnContext,
-        message: impl Into<String>,
-    ) {
-        let event = EventMsg::BackgroundEvent(BackgroundEventEvent {
-            message: message.into(),
-        });
-        self.send_event(turn_context, event).await;
+        self.ensure_rollout_materialized(persist_context).await;
     }
 
     pub(crate) async fn notify_stream_error(
@@ -2800,308 +5113,53 @@ impl Session {
         self.send_event(turn_context, event).await;
     }
 
-    async fn maybe_start_ghost_snapshot(
-        self: &Arc<Self>,
-        turn_context: Arc<TurnContext>,
-        cancellation_token: CancellationToken,
-    ) {
-        if !self.enabled(Feature::GhostCommit) {
-            return;
-        }
-        let token = match turn_context.tool_call_gate.subscribe().await {
-            Ok(token) => token,
-            Err(err) => {
-                warn!("failed to subscribe to ghost snapshot readiness: {err}");
-                return;
-            }
-        };
-
-        info!("spawning ghost snapshot task");
-        let task = GhostSnapshotTask::new(token);
-        Arc::new(task)
-            .run(
-                Arc::new(SessionTaskContext::new(self.clone())),
-                turn_context.clone(),
-                Vec::new(),
-                cancellation_token,
-            )
-            .await;
-    }
-
-    /// Inject additional user input into the currently active turn.
-    ///
-    /// Returns the active turn id when accepted.
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "active turn checks and turn state updates must remain atomic"
-    )]
-    pub async fn steer_input(
-        &self,
-        input: Vec<UserInput>,
-        expected_turn_id: Option<&str>,
-        responsesapi_client_metadata: Option<HashMap<String, String>>,
-    ) -> Result<String, SteerInputError> {
-        if input.is_empty() {
-            return Err(SteerInputError::EmptyInput);
-        }
-
-        let mut active = self.active_turn.lock().await;
-        let Some(active_turn) = active.as_mut() else {
-            return Err(SteerInputError::NoActiveTurn(input));
-        };
-
-        let Some((active_turn_id, _)) = active_turn.tasks.first() else {
-            return Err(SteerInputError::NoActiveTurn(input));
-        };
-
-        if let Some(expected_turn_id) = expected_turn_id
-            && expected_turn_id != active_turn_id
-        {
-            return Err(SteerInputError::ExpectedTurnMismatch {
-                expected: expected_turn_id.to_string(),
-                actual: active_turn_id.clone(),
-            });
-        }
-
-        match active_turn.tasks.first().map(|(_, task)| task.kind) {
-            Some(crate::state::TaskKind::Regular) => {}
-            Some(crate::state::TaskKind::Review) => {
-                return Err(SteerInputError::ActiveTurnNotSteerable {
-                    turn_kind: NonSteerableTurnKind::Review,
-                });
-            }
-            Some(crate::state::TaskKind::Compact) => {
-                return Err(SteerInputError::ActiveTurnNotSteerable {
-                    turn_kind: NonSteerableTurnKind::Compact,
-                });
-            }
-            None => return Err(SteerInputError::NoActiveTurn(input)),
-        }
-
-        if let Some(responsesapi_client_metadata) = responsesapi_client_metadata
-            && let Some((_, active_task)) = active_turn.tasks.first()
-        {
-            active_task
-                .turn_context
-                .turn_metadata_state
-                .set_responsesapi_client_metadata(responsesapi_client_metadata);
-        }
-
-        let mut turn_state = active_turn.turn_state.lock().await;
-        turn_state.push_pending_input(input.into());
-        turn_state.accept_mailbox_delivery_for_current_turn();
-        Ok(active_turn_id.clone())
-    }
-
-    /// Returns the input if there was no task running to inject into.
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "active turn checks and turn state updates must remain atomic"
-    )]
-    pub async fn inject_response_items(
-        &self,
-        input: Vec<ResponseInputItem>,
-    ) -> Result<(), Vec<ResponseInputItem>> {
-        let mut active = self.active_turn.lock().await;
-        match active.as_mut() {
-            Some(at) => {
-                let mut ts = at.turn_state.lock().await;
-                for item in input {
-                    ts.push_pending_input(item);
-                }
-                Ok(())
-            }
-            None => Err(input),
-        }
-    }
-
-    pub(crate) async fn defer_mailbox_delivery_to_next_turn(&self, sub_id: &str) {
-        let turn_state = self.turn_state_for_sub_id(sub_id).await;
-        let Some(turn_state) = turn_state else {
-            return;
-        };
-        let mut turn_state = turn_state.lock().await;
-        if turn_state.has_pending_input() {
-            return;
-        }
-        turn_state.set_mailbox_delivery_phase(MailboxDeliveryPhase::NextTurn);
-    }
-
-    pub(crate) async fn accept_mailbox_delivery_for_current_turn(&self, sub_id: &str) {
-        let turn_state = self.turn_state_for_sub_id(sub_id).await;
-        let Some(turn_state) = turn_state else {
-            return;
-        };
-        turn_state
-            .lock()
-            .await
-            .set_mailbox_delivery_phase(MailboxDeliveryPhase::CurrentTurn);
-    }
-
     pub(crate) async fn record_memory_citation_for_turn(&self, sub_id: &str) {
-        let turn_state = self.turn_state_for_sub_id(sub_id).await;
+        let turn_state = self
+            .input_queue
+            .turn_state_for_sub_id(&self.active_turn, sub_id)
+            .await;
         let Some(turn_state) = turn_state else {
             return;
         };
         turn_state.lock().await.has_memory_citation = true;
     }
 
-    async fn turn_state_for_sub_id(
-        &self,
-        sub_id: &str,
-    ) -> Option<Arc<tokio::sync::Mutex<crate::state::TurnState>>> {
-        let active = self.active_turn.lock().await;
-        active.as_ref().and_then(|active_turn| {
-            active_turn
-                .tasks
-                .contains_key(sub_id)
-                .then(|| Arc::clone(&active_turn.turn_state))
-        })
-    }
-
-    pub(crate) fn subscribe_mailbox_seq(&self) -> watch::Receiver<u64> {
-        self.mailbox.subscribe()
-    }
-
-    pub(crate) fn enqueue_mailbox_communication(&self, communication: InterAgentCommunication) {
-        self.mailbox.send(communication);
-    }
-
-    pub(crate) async fn has_trigger_turn_mailbox_items(&self) -> bool {
-        self.mailbox_rx.lock().await.has_pending_trigger_turn()
-    }
-
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "active turn checks and turn state updates must remain atomic"
-    )]
-    pub async fn prepend_pending_input(&self, input: Vec<ResponseInputItem>) -> Result<(), ()> {
-        let mut active = self.active_turn.lock().await;
-        match active.as_mut() {
-            Some(at) => {
-                let mut ts = at.turn_state.lock().await;
-                ts.prepend_pending_input(input);
-                Ok(())
-            }
-            None => Err(()),
-        }
-    }
-
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "active turn checks and turn state updates must remain atomic"
-    )]
-    pub async fn get_pending_input(&self) -> Vec<ResponseInputItem> {
-        let (pending_input, accepts_mailbox_delivery) = {
-            let mut active = self.active_turn.lock().await;
-            match active.as_mut() {
-                Some(at) => {
-                    let mut ts = at.turn_state.lock().await;
-                    (
-                        ts.take_pending_input(),
-                        ts.accepts_mailbox_delivery_for_current_turn(),
-                    )
-                }
-                None => (Vec::new(), true),
-            }
-        };
-        if !accepts_mailbox_delivery {
-            return pending_input;
-        }
-        let mailbox_items = {
-            let mut mailbox_rx = self.mailbox_rx.lock().await;
-            mailbox_rx
-                .drain()
-                .into_iter()
-                .map(|mail| mail.to_response_input_item())
-                .collect::<Vec<_>>()
-        };
-        if pending_input.is_empty() {
-            mailbox_items
-        } else if mailbox_items.is_empty() {
-            pending_input
-        } else {
-            let mut pending_input = pending_input;
-            pending_input.extend(mailbox_items);
-            pending_input
-        }
-    }
-
-    /// Queue response items to be injected into the next active turn created for this session.
-    #[cfg(test)]
-    pub(crate) async fn queue_response_items_for_next_turn(&self, items: Vec<ResponseInputItem>) {
-        if items.is_empty() {
-            return;
-        }
-
-        let mut idle_pending_input = self.idle_pending_input.lock().await;
-        idle_pending_input.extend(items);
-    }
-
-    pub(crate) async fn take_queued_response_items_for_next_turn(&self) -> Vec<ResponseInputItem> {
-        std::mem::take(&mut *self.idle_pending_input.lock().await)
-    }
-
-    pub(crate) async fn has_queued_response_items_for_next_turn(&self) -> bool {
-        !self.idle_pending_input.lock().await.is_empty()
-    }
-
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "active turn checks and turn state reads must remain atomic"
-    )]
-    pub async fn has_pending_input(&self) -> bool {
-        let (has_turn_pending_input, accepts_mailbox_delivery) = {
-            let active = self.active_turn.lock().await;
-            match active.as_ref() {
-                Some(at) => {
-                    let ts = at.turn_state.lock().await;
-                    (
-                        ts.has_pending_input(),
-                        ts.accepts_mailbox_delivery_for_current_turn(),
-                    )
-                }
-                None => (false, true),
-            }
-        };
-        if has_turn_pending_input {
-            return true;
-        }
-        if !accepts_mailbox_delivery {
-            return false;
-        }
-        self.mailbox_rx.lock().await.has_pending()
-    }
-
     pub async fn interrupt_task(self: &Arc<Self>) {
         info!("interrupt received: abort current task, if any");
-        let has_active_turn = { self.active_turn.lock().await.is_some() };
-        if has_active_turn {
-            self.abort_all_tasks(TurnAbortReason::Interrupted).await;
-        } else {
-            self.cancel_mcp_startup().await;
+        let had_active_turn = self.active_turn.lock().await.is_some();
+        self.abort_all_tasks(TurnAbortReason::Interrupted).await;
+        if !had_active_turn {
+            self.cancel_mcp_startup();
         }
     }
 
-    pub(crate) fn hooks(&self) -> &Hooks {
-        &self.services.hooks
+    pub(crate) fn hooks(&self) -> Arc<Hooks> {
+        self.services.hooks.load_full()
     }
 
     pub(crate) fn user_shell(&self) -> Arc<shell::Shell> {
         Arc::clone(&self.services.user_shell)
     }
 
-    pub(crate) async fn current_rollout_path(&self) -> Option<PathBuf> {
-        let recorder = {
-            let guard = self.services.rollout.lock().await;
-            guard.clone()
+    pub(crate) async fn current_rollout_path(&self) -> anyhow::Result<Option<PathBuf>> {
+        let Some(live_thread) = self.live_thread() else {
+            return Ok(None);
         };
-        recorder.map(|recorder| recorder.rollout_path().to_path_buf())
+        live_thread.local_rollout_path().await.map_err(Into::into)
     }
 
     pub(crate) async fn hook_transcript_path(&self) -> Option<PathBuf> {
-        self.ensure_rollout_materialized().await;
-        self.current_rollout_path().await
+        let rollout_path = match self.current_rollout_path().await {
+            Ok(Some(path)) => path,
+            Ok(None) => return None,
+            Err(err) => {
+                warn!("{err}");
+                return None;
+            }
+        };
+        self.ensure_rollout_materialized(PersistContext::Standard)
+            .await;
+        Some(rollout_path)
     }
 
     pub(crate) async fn take_pending_session_start_source(
@@ -3116,94 +5174,127 @@ impl Session {
     }
 }
 
+fn apply_prepared_image_file_ids(
+    user_message_item: &mut UserMessageItem,
+    prepared_items: &[ResponseItemEnvelope],
+    user_image_content_indices: &HashMap<usize, usize>,
+) {
+    // Preparation replaces image slots in place; resize notices are separate messages.
+    // Read the references from the original message while retaining UI-only input spans.
+    if let Some(ResponseItemEnvelope {
+        item: ResponseItem::Message { content, .. },
+        ..
+    }) = prepared_items.first()
+    {
+        for (&input_index, &content_index) in user_image_content_indices {
+            if let Some(ContentItem::InputImage {
+                image: ImageReference::File { file_id },
+                ..
+            }) = content.get(content_index)
+                && let UserInput::Image { detail, .. } | UserInput::LocalImage { detail, .. } =
+                    &user_message_item.content[input_index]
+            {
+                user_message_item.content[input_index] = UserInput::Image {
+                    image: ImageReference::File {
+                        file_id: file_id.clone(),
+                    },
+                    detail: *detail,
+                };
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_subagent_session_started(
     analytics_events_client: &AnalyticsEventsClient,
     client_metadata: AppServerClientMetadata,
+    session_id: SessionId,
     thread_id: ThreadId,
     parent_thread_id: Option<ThreadId>,
     thread_config: ThreadConfigSnapshot,
     subagent_source: SubAgentSource,
+    resumed_created_at: Option<DateTime<Utc>>,
 ) {
+    let initialization_mode = if resumed_created_at.is_some() {
+        ThreadInitializationMode::Resumed
+    } else {
+        ThreadInitializationMode::New
+    };
+    let created_at =
+        u64::try_from(resumed_created_at.unwrap_or_else(Utc::now).timestamp()).unwrap_or_default();
     let AppServerClientMetadata {
         client_name,
         client_version,
     } = client_metadata;
-    let (Some(client_name), Some(client_version)) = (client_name, client_version) else {
+    if (client_name.is_none() || client_version.is_none())
+        && subagent_source.kind() != crate::guardian::GUARDIAN_REVIEWER_NAME
+    {
         tracing::warn!("skipping subagent thread analytics: missing inherited client metadata");
         return;
-    };
-    let created_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    analytics_events_client.track_subagent_thread_started(SubAgentThreadStartedInput {
+    }
+    let input = SubAgentThreadStartedInput {
+        session_id: session_id.to_string(),
         thread_id: thread_id.to_string(),
         parent_thread_id: parent_thread_id.map(|thread_id| thread_id.to_string()),
-        product_client_id: client_name.clone(),
+        forked_from_thread_id: thread_config
+            .forked_from_thread_id
+            .map(|thread_id| thread_id.to_string()),
+        product_client_id: thread_config.originator.clone(),
         client_name,
         client_version,
         model: thread_config.model,
         ephemeral: thread_config.ephemeral,
+        thread_source: thread_config.thread_source,
         subagent_source,
+        initialization_mode,
         created_at,
-    });
+    };
+    analytics_events_client.track_subagent_thread_started(input);
 }
 
-fn skills_to_info(
-    skills: &[SkillMetadata],
-    disabled_paths: &HashSet<AbsolutePathBuf>,
-) -> Vec<ProtocolSkillMetadata> {
-    skills
-        .iter()
-        .map(|skill| ProtocolSkillMetadata {
-            name: skill.name.clone(),
-            description: skill.description.clone(),
-            short_description: skill.short_description.clone(),
-            interface: skill
-                .interface
-                .clone()
-                .map(|interface| ProtocolSkillInterface {
-                    display_name: interface.display_name,
-                    short_description: interface.short_description,
-                    icon_small: interface.icon_small,
-                    icon_large: interface.icon_large,
-                    brand_color: interface.brand_color,
-                    default_prompt: interface.default_prompt,
-                }),
-            dependencies: skill.dependencies.clone().map(|dependencies| {
-                ProtocolSkillDependencies {
-                    tools: dependencies
-                        .tools
-                        .into_iter()
-                        .map(|tool| ProtocolSkillToolDependency {
-                            r#type: tool.r#type,
-                            value: tool.value,
-                            description: tool.description,
-                            transport: tool.transport,
-                            command: tool.command,
-                            url: tool.url,
-                        })
-                        .collect(),
-                }
-            }),
-            path: skill.path_to_skills_md.clone(),
-            scope: skill.scope,
-            enabled: !disabled_paths.contains(&skill.path_to_skills_md),
+/// Builds hook configuration for one config snapshot, including any enabled plugin hooks.
+async fn build_hooks_config(
+    config: &Config,
+    plugins_manager: &PluginsManager,
+    environment: Option<&TurnEnvironment>,
+    disabled_plugin_ids: &[String],
+) -> HooksConfig {
+    let (hook_shell_program, hook_shell_argv) = environment
+        .and_then(|environment| environment.shell.as_ref())
+        .map(|shell| {
+            let mut argv = shell.derive_exec_args("", /*use_login_shell*/ false);
+            let program = argv.remove(0);
+            let _ = argv.pop();
+            (Some(program), argv)
         })
-        .collect()
+        .unwrap_or_default();
+    let plugins_input = config.plugins_config_input();
+    let plugin_outcome = plugins_manager
+        .plugins_for_config(&plugins_input)
+        .await
+        .without_plugins(disabled_plugin_ids);
+    let plugin_hook_sources = plugin_outcome.effective_plugin_hook_sources();
+    let plugin_hook_load_warnings = plugin_outcome.effective_plugin_hook_warnings();
+    HooksConfig {
+        legacy_notify_argv: config.notify.clone(),
+        feature_enabled: config.features.enabled(Feature::CodexHooks),
+        bypass_hook_trust: config.bypass_hook_trust,
+        config_layer_stack: Some(config.config_layer_stack.clone()),
+        plugin_hook_sources,
+        plugin_hook_load_warnings,
+        shell_program: hook_shell_program,
+        shell_args: hook_shell_argv,
+    }
 }
 
-fn errors_to_info(errors: &[SkillError]) -> Vec<SkillErrorInfo> {
-    errors
-        .iter()
-        .map(|err| SkillErrorInfo {
-            path: err.path.to_path_buf(),
-            message: err.message.clone(),
-        })
-        .collect()
-}
-
-use crate::memories::prompts::build_memory_tool_developer_instructions;
+#[cfg(test)]
+#[path = "elicitation_holders_tests.rs"]
+mod elicitation_holders_tests;
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+#[path = "world_state_item_tests.rs"]
+mod world_state_item_tests;

@@ -1,50 +1,48 @@
-use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;
-use codex_models_manager::collaboration_mode_presets::builtin_collaboration_mode_presets;
+//! TUI model and collaboration inventories; refreshing models preserves the server mode catalog.
+
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::openai_models::ModelPreset;
 use std::convert::Infallible;
 
+pub(crate) const LUNA_RESERVE_MODEL: &str = "gpt-reserve";
+pub(crate) const LUNA_MODEL: &str = "gpt-6-luna";
+
+pub(crate) fn model_display_name(model: &str) -> &str {
+    if model.eq_ignore_ascii_case(LUNA_RESERVE_MODEL) {
+        "Luna Reserve"
+    } else {
+        model
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ModelCatalog {
-    models: Vec<ModelPreset>,
-    collaboration_modes_config: CollaborationModesConfig,
+    pub(crate) models: Vec<ModelPreset>,
+    pub(crate) collaboration_modes: Vec<CollaborationModeMask>,
 }
 
 impl ModelCatalog {
-    pub(crate) fn new(
-        models: Vec<ModelPreset>,
-        collaboration_modes_config: CollaborationModesConfig,
-    ) -> Self {
+    pub(crate) fn new(models: Vec<ModelPreset>) -> Self {
         Self {
             models,
-            collaboration_modes_config,
+            collaboration_modes: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_collaboration_modes(mut self, modes: Vec<CollaborationModeMask>) -> Self {
+        self.collaboration_modes = modes;
+        self
     }
 
     pub(crate) fn try_list_models(&self) -> Result<Vec<ModelPreset>, Infallible> {
         Ok(self.models.clone())
     }
 
-    pub(crate) fn list_collaboration_modes(&self) -> Vec<CollaborationModeMask> {
-        builtin_collaboration_mode_presets(self.collaboration_modes_config)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use pretty_assertions::assert_eq;
-
-    #[test]
-    fn list_collaboration_modes_matches_core_presets() {
-        let collaboration_modes_config = CollaborationModesConfig {
-            default_mode_request_user_input: true,
-        };
-        let catalog = ModelCatalog::new(Vec::new(), collaboration_modes_config);
-
-        assert_eq!(
-            catalog.list_collaboration_modes(),
-            builtin_collaboration_mode_presets(collaboration_modes_config)
-        );
+    pub(crate) fn display_name<'a>(&'a self, model: &'a str) -> &'a str {
+        self.models
+            .iter()
+            .find(|preset| preset.model == model)
+            .map(|preset| preset.display_name.as_str())
+            .unwrap_or_else(|| model_display_name(model))
     }
 }

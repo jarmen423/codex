@@ -1,12 +1,13 @@
-use base64::Engine as _;
 use chrono::DateTime;
 use chrono::Local;
 use chrono::Utc;
-use reqwest::header::HeaderMap;
-use std::sync::Arc;
+use http::header::HeaderMap;
 
 use codex_core::config::Config;
+use codex_http_client::HttpClientFactory;
+use codex_http_client::OutboundProxyPolicy;
 use codex_login::AuthManager;
+use std::sync::Arc;
 
 pub fn set_user_agent_suffix(suffix: &str) {
     if let Ok(mut guard) = codex_login::default_client::USER_AGENT_SUFFIX.lock() {
@@ -30,10 +31,7 @@ pub fn append_error_log(message: impl AsRef<str>) {
 /// - trims trailing '/'
 /// - appends '/backend-api' for ChatGPT hosts when missing
 pub fn normalize_base_url(input: &str) -> String {
-    let mut base_url = input.to_string();
-    while base_url.ends_with('/') {
-        base_url.pop();
-    }
+    let mut base_url = input.trim_end_matches('/').to_string();
     if (base_url.starts_with("https://chatgpt.com")
         || base_url.starts_with("https://chat.openai.com"))
         && !base_url.contains("/backend-api")
@@ -43,40 +41,78 @@ pub fn normalize_base_url(input: &str) -> String {
     base_url
 }
 
-/// Extract the ChatGPT account id from a JWT token, when present.
-pub fn extract_chatgpt_account_id(token: &str) -> Option<String> {
-    let mut parts = token.split('.');
-    let (_h, payload_b64, _s) = match (parts.next(), parts.next(), parts.next()) {
-        (Some(h), Some(p), Some(s)) if !h.is_empty() && !p.is_empty() && !s.is_empty() => (h, p, s),
-        _ => return None,
+/// Validate the destination before loading saved ChatGPT credentials, including in mock mode:
+/// environment discovery still makes authenticated HTTP requests when the task backend is mocked.
+pub(crate) fn validate_chatgpt_base_url(input: &str) -> anyhow::Result<String> {
+    let invalid_url = || {
+        anyhow::anyhow!(
+            "CODEX_CLOUD_TASKS_BASE_URL must use a trusted HTTPS origin on port 443, without user information, a query, or a fragment; custom backends cannot use saved ChatGPT credentials"
+        )
     };
-    let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload_b64)
-        .ok()?;
-    let v: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
-    v.get("https://api.openai.com/auth")
-        .and_then(|auth| auth.get("chatgpt_account_id"))
-        .and_then(|id| id.as_str())
-        .map(str::to_string)
-}
-
-pub async fn load_auth_manager(chatgpt_base_url: Option<String>) -> Option<Arc<AuthManager>> {
-    // TODO: pass in cli overrides once cloud tasks properly support them.
-    let config = Config::load_with_cli_overrides(Vec::new()).await.ok()?;
-    let auth_manager =
-        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false);
-    if let Some(chatgpt_base_url) = chatgpt_base_url {
-        auth_manager.set_chatgpt_backend_base_url(Some(chatgpt_base_url));
+    let uri = input.parse::<http::Uri>().map_err(|_| invalid_url())?;
+    let authority = uri
+        .authority()
+        .ok_or_else(invalid_url)?
+        .as_str()
+        .to_ascii_lowercase();
+    if uri.scheme_str() != Some("https")
+        || !matches!(
+            authority.as_str(),
+            "chatgpt.com"
+                | "chatgpt.com:443"
+                | "chat.openai.com"
+                | "chat.openai.com:443"
+                | "chatgpt-staging.com"
+                | "chatgpt-staging.com:443"
+        )
+        || uri.query().is_some()
+        || input.contains('#')
+    {
+        return Err(invalid_url());
     }
-    Some(auth_manager)
+    Ok(normalize_base_url(&format!(
+        "https://{authority}{}",
+        uri.path()
+    )))
 }
 
-/// Build headers for ChatGPT-backed requests.
+pub async fn load_auth_manager(
+    chatgpt_base_url: Option<String>,
+) -> (Option<Arc<AuthManager>>, HttpClientFactory) {
+    // TODO: pass in cli overrides once cloud tasks properly support them.
+    let config = match Config::load_with_cli_overrides(Vec::new()).await {
+        Ok(config) => config,
+        Err(error) => {
+            append_error_log(format!(
+                "failed to load auth config; using transport-default proxy handling: {error}"
+            ));
+            let http_client_factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
+            return (None, http_client_factory);
+        }
+    };
+    let http_client_factory = config.http_client_factory();
+    let mut auth_config = config.auth_config();
+    auth_config.chatgpt_base_url = chatgpt_base_url.or(Some(config.chatgpt_base_url.clone()));
+    let auth_manager = match AuthManager::shared_from_auth_config(
+        auth_config,
+        /*enable_codex_api_key_env*/ false,
+    )
+    .await
+    {
+        Ok(auth_manager) => auth_manager,
+        Err(error) => {
+            append_error_log(format!("failed to load auth: {error}"));
+            return (None, http_client_factory);
+        }
+    };
+    (Some(auth_manager), http_client_factory)
+}
+
+/// Build headers for ChatGPT-backed requests: `User-Agent`, optional `Authorization`,
+/// and optional `ChatGPT-Account-Id`.
 pub async fn build_chatgpt_headers() -> HeaderMap {
-    use reqwest::header::AUTHORIZATION;
-    use reqwest::header::HeaderName;
-    use reqwest::header::HeaderValue;
-    use reqwest::header::USER_AGENT;
+    use http::header::HeaderValue;
+    use http::header::USER_AGENT;
 
     set_user_agent_suffix("codex_cloud_tasks_tui");
     let ua = codex_login::default_client::get_codex_user_agent();
@@ -85,34 +121,11 @@ pub async fn build_chatgpt_headers() -> HeaderMap {
         USER_AGENT,
         HeaderValue::from_str(&ua).unwrap_or(HeaderValue::from_static("codex-cli")),
     );
-    let base_url = normalize_base_url(
-        &std::env::var("CODEX_CLOUD_TASKS_BASE_URL")
-            .unwrap_or_else(|_| "https://chatgpt.com/backend-api".to_string()),
-    );
-    if let Some(auth_manager) = load_auth_manager(Some(base_url)).await
-        && let Some(auth) = auth_manager.auth().await
+    if let Some(am) = load_auth_manager(/*chatgpt_base_url*/ None).await.0
+        && let Some(auth) = am.auth().await
+        && auth.uses_codex_backend()
     {
-        if let Some(authorization_header_value) = auth_manager
-            .chatgpt_authorization_header_for_auth(&auth)
-            .await
-            && let Ok(hv) = HeaderValue::from_str(&authorization_header_value)
-        {
-            headers.insert(AUTHORIZATION, hv);
-        }
-        if let Some(acc) = auth.get_account_id().or_else(|| {
-            auth.get_token()
-                .ok()
-                .and_then(|token| extract_chatgpt_account_id(&token))
-        }) && let Ok(name) = HeaderName::from_bytes(b"ChatGPT-Account-Id")
-            && let Ok(hv) = HeaderValue::from_str(&acc)
-        {
-            headers.insert(name, hv);
-        }
-        if auth.is_fedramp_account()
-            && let Ok(name) = HeaderName::from_bytes(b"X-OpenAI-Fedramp")
-        {
-            headers.insert(name, HeaderValue::from_static("true"));
-        }
+        headers.extend(codex_model_provider::auth_provider_from_auth(&auth).to_auth_headers());
     }
     headers
 }
@@ -154,4 +167,37 @@ pub fn format_relative_time(reference: DateTime<Utc>, ts: DateTime<Utc>) -> Stri
 
 pub fn format_relative_time_now(ts: DateTime<Utc>) -> String {
     format_relative_time(Utc::now(), ts)
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use super::normalize_base_url;
+
+    #[test]
+    fn normalize_base_url_normalizes_urls() {
+        for (input, expected) in [
+            ("https://example.com/path", "https://example.com/path"),
+            ("https://example.com/path/", "https://example.com/path"),
+            ("https://example.com/path///", "https://example.com/path"),
+            ("", ""),
+            ("///", ""),
+            ("https://chatgpt.com///", "https://chatgpt.com/backend-api"),
+            (
+                "https://chatgpt.com/backend-api///",
+                "https://chatgpt.com/backend-api",
+            ),
+            (
+                "https://chat.openai.com///",
+                "https://chat.openai.com/backend-api",
+            ),
+            (
+                "https://chat.openai.com/backend-api///",
+                "https://chat.openai.com/backend-api",
+            ),
+        ] {
+            assert_eq!(normalize_base_url(input), expected, "input: {input:?}");
+        }
+    }
 }

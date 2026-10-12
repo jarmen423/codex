@@ -10,9 +10,15 @@
         "preToolUse",
         "permissionRequest",
         "postToolUse",
+        "preCompact",
+        "postCompact",
         "sessionStart",
+        "sessionEnd",
         "userPromptSubmit",
-        "stop"
+        "subagentStart",
+        "subagentStop",
+        "stop",
+        "interrupt"
       ],
       "type": "string"
     },
@@ -26,6 +32,7 @@
     "HookHandlerType": {
       "enum": [
         "command",
+        "mcpTool",
         "prompt",
         "agent"
       ],
@@ -160,6 +167,9 @@
         "project",
         "mdm",
         "sessionFlags",
+        "plugin",
+        "cloudRequirements",
+        "cloudManagedConfig",
         "legacyManagedConfigFile",
         "legacyManagedConfigMdm",
         "unknown"

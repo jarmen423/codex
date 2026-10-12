@@ -1,13 +1,17 @@
+use crate::PluginGitMode;
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
 use std::process::Output;
 use std::process::Stdio;
 use std::time::Duration;
 
 pub(super) fn git_remote_revision(
+    codex_home: &Path,
     source: &str,
     ref_name: Option<&str>,
     timeout: Duration,
+    mode: PluginGitMode,
 ) -> Result<String, String> {
     if let Some(ref_name) = ref_name
         && is_full_git_sha(ref_name)
@@ -16,8 +20,12 @@ pub(super) fn git_remote_revision(
     }
 
     let ref_name = ref_name.unwrap_or("HEAD");
+    let mut command = git_command(mode);
+    let _trusted_repository = matches!(mode, PluginGitMode::Automatic)
+        .then(|| crate::configure_trusted_git_repository(&mut command, codex_home))
+        .transpose()?;
     let output = run_git_command_with_timeout(
-        git_command().arg("ls-remote").arg(source).arg(ref_name),
+        command.arg("ls-remote").arg(source).arg(ref_name),
         "git ls-remote marketplace source",
         timeout,
     )?;
@@ -40,24 +48,31 @@ pub(super) fn git_remote_revision(
 }
 
 pub(super) fn clone_git_source(
+    codex_home: &Path,
     source: &str,
     ref_name: Option<&str>,
     sparse_paths: &[String],
     destination: &Path,
     timeout: Duration,
+    mode: PluginGitMode,
 ) -> Result<String, String> {
+    let git_destination = git_path_arg(destination);
+    let mut command = git_command(mode);
+    let _trusted_repository = matches!(mode, PluginGitMode::Automatic)
+        .then(|| crate::configure_trusted_git_repository(&mut command, codex_home))
+        .transpose()?;
     if sparse_paths.is_empty() {
         let output = run_git_command_with_timeout(
-            git_command().arg("clone").arg(source).arg(destination),
+            command.arg("clone").arg(source).arg(&git_destination),
             "git clone marketplace source",
             timeout,
         )?;
         ensure_git_success(&output, "git clone marketplace source")?;
         if let Some(ref_name) = ref_name {
             let output = run_git_command_with_timeout(
-                git_command()
+                git_command(mode)
                     .arg("-C")
-                    .arg(destination)
+                    .arg(&git_destination)
                     .arg("checkout")
                     .arg(ref_name),
                 "git checkout marketplace ref",
@@ -65,25 +80,25 @@ pub(super) fn clone_git_source(
             )?;
             ensure_git_success(&output, "git checkout marketplace ref")?;
         }
-        return git_worktree_revision(destination, timeout);
+        return git_worktree_revision(&git_destination, timeout, mode);
     }
 
     let output = run_git_command_with_timeout(
-        git_command()
+        command
             .arg("clone")
             .arg("--filter=blob:none")
             .arg("--no-checkout")
             .arg(source)
-            .arg(destination),
+            .arg(&git_destination),
         "git clone marketplace source",
         timeout,
     )?;
     ensure_git_success(&output, "git clone marketplace source")?;
 
-    let mut sparse_checkout = git_command();
+    let mut sparse_checkout = git_command(mode);
     sparse_checkout
         .arg("-C")
-        .arg(destination)
+        .arg(&git_destination)
         .arg("sparse-checkout")
         .arg("set")
         .args(sparse_paths);
@@ -95,21 +110,25 @@ pub(super) fn clone_git_source(
     ensure_git_success(&output, "git sparse-checkout marketplace source")?;
 
     let output = run_git_command_with_timeout(
-        git_command()
+        git_command(mode)
             .arg("-C")
-            .arg(destination)
+            .arg(&git_destination)
             .arg("checkout")
             .arg(ref_name.unwrap_or("HEAD")),
         "git checkout marketplace ref",
         timeout,
     )?;
     ensure_git_success(&output, "git checkout marketplace ref")?;
-    git_worktree_revision(destination, timeout)
+    git_worktree_revision(&git_destination, timeout, mode)
 }
 
-fn git_worktree_revision(destination: &Path, timeout: Duration) -> Result<String, String> {
+fn git_worktree_revision(
+    destination: &Path,
+    timeout: Duration,
+    mode: PluginGitMode,
+) -> Result<String, String> {
     let output = run_git_command_with_timeout(
-        git_command()
+        git_command(mode)
             .arg("-C")
             .arg(destination)
             .arg("rev-parse")
@@ -131,12 +150,34 @@ fn is_full_git_sha(value: &str) -> bool {
     value.len() == 40 && value.chars().all(|ch| ch.is_ascii_hexdigit())
 }
 
-fn git_command() -> Command {
-    let mut command = Command::new("git");
+fn git_command(mode: PluginGitMode) -> Command {
+    let mut command = mode.command(Path::new("git"));
     command
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0");
     command
+}
+
+#[cfg(windows)]
+fn git_path_arg(path: &Path) -> PathBuf {
+    strip_windows_verbatim_path_prefix(&path.to_string_lossy())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
+#[cfg(not(windows))]
+fn git_path_arg(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
+#[cfg(any(windows, test))]
+fn strip_windows_verbatim_path_prefix(path: &str) -> Option<String> {
+    let stripped = path.strip_prefix(r"\\?\")?;
+    let stripped = stripped
+        .strip_prefix(r"UNC\")
+        .map(|unc_path| format!(r"\\{unc_path}"))
+        .unwrap_or_else(|| stripped.to_string());
+    Some(stripped)
 }
 
 fn run_git_command_with_timeout(
@@ -201,6 +242,8 @@ fn ensure_git_success(output: &Output, context: &str) -> Result<(), String> {
 mod tests {
     use super::git_command;
     use super::is_full_git_sha;
+    use super::strip_windows_verbatim_path_prefix;
+    use pretty_assertions::assert_eq;
     use std::ffi::OsStr;
 
     #[test]
@@ -212,9 +255,16 @@ mod tests {
 
     #[test]
     fn git_command_uses_path_lookup_with_stable_noninteractive_env() {
-        let command = git_command();
+        let command = git_command(crate::PluginGitMode::Automatic);
 
         assert_eq!(command.get_program(), OsStr::new("git"));
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                OsStr::new("-c"),
+                OsStr::new(codex_git_utils::SAFE_BARE_REPOSITORY_CONFIG),
+            ]
+        );
         assert_eq!(
             command_env(&command, "GIT_OPTIONAL_LOCKS"),
             Some(Some(OsStr::new("0")))
@@ -224,6 +274,27 @@ mod tests {
             Some(Some(OsStr::new("0")))
         );
         assert_eq!(command_env(&command, "PATH"), None);
+    }
+
+    #[test]
+    fn strips_windows_verbatim_disk_prefix_for_git() {
+        assert_eq!(
+            strip_windows_verbatim_path_prefix(r"\\?\C:\Users\alice\marketplace"),
+            Some(r"C:\Users\alice\marketplace".to_string())
+        );
+    }
+
+    #[test]
+    fn strips_windows_verbatim_unc_prefix_for_git() {
+        assert_eq!(
+            strip_windows_verbatim_path_prefix(r"\\?\UNC\server\share\marketplace"),
+            Some(r"\\server\share\marketplace".to_string())
+        );
+    }
+
+    #[test]
+    fn leaves_non_verbatim_path_without_rewrite() {
+        assert_eq!(strip_windows_verbatim_path_prefix(r"C:\Users\alice"), None);
     }
 
     fn command_env<'a>(
