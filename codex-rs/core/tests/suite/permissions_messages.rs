@@ -1,8 +1,10 @@
 use anyhow::Result;
 use codex_core::ForkSnapshot;
 use codex_core::config::Constrained;
-use codex_execpolicy::Policy;
-use codex_protocol::models::DeveloperInstructions;
+use codex_core::config_loader::ConfigLayerStack;
+use codex_core::context::ContextualUserFragment;
+use codex_core::context::PermissionsInstructions;
+use codex_core::load_exec_policy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
@@ -48,11 +50,13 @@ async fn permissions_message_sent_once_on_start() -> Result<()> {
 
     test.codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "hello".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -85,11 +89,13 @@ async fn permissions_message_added_on_override_change() -> Result<()> {
 
     test.codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "hello 1".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -100,6 +106,7 @@ async fn permissions_message_added_on_override_change() -> Result<()> {
             approval_policy: Some(AskForApproval::Never),
             approvals_reviewer: None,
             sandbox_policy: None,
+            permission_profile: None,
             windows_sandbox_level: None,
             model: None,
             effort: None,
@@ -112,11 +119,13 @@ async fn permissions_message_added_on_override_change() -> Result<()> {
 
     test.codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "hello 2".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -155,22 +164,26 @@ async fn permissions_message_not_added_when_no_change() -> Result<()> {
 
     test.codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "hello 1".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     test.codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "hello 2".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -209,11 +222,13 @@ async fn permissions_message_omitted_when_disabled() -> Result<()> {
 
     test.codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "hello 1".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -224,6 +239,7 @@ async fn permissions_message_omitted_when_disabled() -> Result<()> {
             approval_policy: Some(AskForApproval::Never),
             approvals_reviewer: None,
             sandbox_policy: None,
+            permission_profile: None,
             windows_sandbox_level: None,
             model: None,
             effort: None,
@@ -236,11 +252,13 @@ async fn permissions_message_omitted_when_disabled() -> Result<()> {
 
     test.codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "hello 2".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -292,11 +310,13 @@ async fn resume_replays_permissions_messages() -> Result<()> {
     initial
         .codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "hello 1".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&initial.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -308,6 +328,7 @@ async fn resume_replays_permissions_messages() -> Result<()> {
             approval_policy: Some(AskForApproval::Never),
             approvals_reviewer: None,
             sandbox_policy: None,
+            permission_profile: None,
             windows_sandbox_level: None,
             model: None,
             effort: None,
@@ -321,11 +342,13 @@ async fn resume_replays_permissions_messages() -> Result<()> {
     initial
         .codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "hello 2".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&initial.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -334,11 +357,13 @@ async fn resume_replays_permissions_messages() -> Result<()> {
     resumed
         .codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "after resume".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&resumed.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -391,11 +416,13 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
     initial
         .codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "hello 1".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&initial.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -407,6 +434,7 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
             approval_policy: Some(AskForApproval::Never),
             approvals_reviewer: None,
             sandbox_policy: None,
+            permission_profile: None,
             windows_sandbox_level: None,
             model: None,
             effort: None,
@@ -420,11 +448,13 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
     initial
         .codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "hello 2".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&initial.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -439,11 +469,13 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
     resumed
         .codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "after resume".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&resumed.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -471,11 +503,13 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
     forked
         .thread
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "after fork".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&forked.thread, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -508,7 +542,6 @@ async fn permissions_message_includes_writable_roots() -> Result<()> {
     let writable_root = AbsolutePathBuf::try_from(writable.path())?;
     let sandbox_policy = SandboxPolicy::WorkspaceWrite {
         writable_roots: vec![writable_root],
-        read_only_access: Default::default(),
         network_access: false,
         exclude_tmpdir_env_var: false,
         exclude_slash_tmp: false,
@@ -518,33 +551,36 @@ async fn permissions_message_includes_writable_roots() -> Result<()> {
     let mut builder = test_codex().with_config(move |config| {
         config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
         config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy_for_config);
+        config.config_layer_stack = ConfigLayerStack::default();
     });
     let test = builder.build(&server).await?;
 
     test.codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "hello".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let permissions = permissions_texts(&req.single_request());
-    let expected = DeveloperInstructions::from_policy(
+    let normalize_line_endings = |s: &str| s.replace("\r\n", "\n");
+    let exec_policy = load_exec_policy(&test.config.config_layer_stack).await?;
+    let expected = PermissionsInstructions::from_policy(
         &sandbox_policy,
         AskForApproval::OnRequest,
         test.config.approvals_reviewer,
-        &Policy::empty(),
+        &exec_policy,
         test.config.cwd.as_path(),
         /*exec_permission_approvals_enabled*/ false,
         /*request_permissions_tool_enabled*/ false,
     )
-    .into_text();
-    // Normalize line endings to handle Windows vs Unix differences
-    let normalize_line_endings = |s: &str| s.replace("\r\n", "\n");
+    .render();
     let expected_normalized = normalize_line_endings(&expected);
     let actual_normalized: Vec<String> = permissions
         .iter()

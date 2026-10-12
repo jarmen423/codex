@@ -29,12 +29,15 @@ use codex_protocol::mcp::Resource;
 use codex_protocol::mcp::ResourceTemplate;
 use codex_protocol::mcp::Tool;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::McpAuthStatus;
 use codex_protocol::protocol::McpListToolsResponseEvent;
 use codex_protocol::protocol::SandboxPolicy;
+use rmcp::model::ReadResourceRequestParams;
+use rmcp::model::ReadResourceResult;
 use serde_json::Value;
 
 use crate::mcp_connection_manager::McpConnectionManager;
-use crate::mcp_connection_manager::SandboxState;
+use crate::mcp_connection_manager::McpRuntimeEnvironment;
 use crate::mcp_connection_manager::codex_apps_tools_cache_key;
 pub type McpManager = McpConnectionManager;
 
@@ -202,31 +205,6 @@ fn codex_apps_mcp_bearer_token_env_var() -> Option<String> {
     }
 }
 
-fn codex_apps_mcp_bearer_token(auth: Option<&CodexAuth>) -> Option<String> {
-    let token = auth.and_then(|auth| auth.get_token().ok())?;
-    let token = token.trim();
-    if token.is_empty() {
-        None
-    } else {
-        Some(token.to_string())
-    }
-}
-
-fn codex_apps_mcp_http_headers(auth: Option<&CodexAuth>) -> Option<HashMap<String, String>> {
-    let mut headers = HashMap::new();
-    if let Some(token) = codex_apps_mcp_bearer_token(auth) {
-        headers.insert("Authorization".to_string(), format!("Bearer {token}"));
-    }
-    if let Some(account_id) = auth.and_then(CodexAuth::get_account_id) {
-        headers.insert("ChatGPT-Account-ID".to_string(), account_id);
-    }
-    if headers.is_empty() {
-        None
-    } else {
-        Some(headers)
-    }
-}
-
 fn normalize_codex_apps_base_url(base_url: &str) -> String {
     let mut base_url = base_url.trim_end_matches('/').to_string();
     if (base_url.starts_with("https://chatgpt.com")
@@ -253,27 +231,24 @@ pub(crate) fn codex_apps_mcp_url(config: &McpConfig) -> String {
     codex_apps_mcp_url_for_base_url(&config.chatgpt_base_url)
 }
 
-fn codex_apps_mcp_server_config(config: &McpConfig, auth: Option<&CodexAuth>) -> McpServerConfig {
-    let bearer_token_env_var = codex_apps_mcp_bearer_token_env_var();
-    let http_headers = if bearer_token_env_var.is_some() {
-        None
-    } else {
-        codex_apps_mcp_http_headers(auth)
-    };
+fn codex_apps_mcp_server_config(config: &McpConfig) -> McpServerConfig {
     let url = codex_apps_mcp_url(config);
 
     McpServerConfig {
         transport: McpServerTransportConfig::StreamableHttp {
             url,
-            bearer_token_env_var,
-            http_headers,
+            bearer_token_env_var: codex_apps_mcp_bearer_token_env_var(),
+            http_headers: None,
             env_http_headers: None,
         },
+        experimental_environment: None,
         enabled: true,
         required: false,
+        supports_parallel_tool_calls: false,
         disabled_reason: None,
         startup_timeout_sec: Some(Duration::from_secs(30)),
         tool_timeout_sec: None,
+        default_tools_approval_mode: None,
         enabled_tools: None,
         disabled_tools: None,
         scopes: None,
@@ -287,10 +262,10 @@ pub fn with_codex_apps_mcp(
     auth: Option<&CodexAuth>,
     config: &McpConfig,
 ) -> HashMap<String, McpServerConfig> {
-    if config.apps_enabled && auth.is_some_and(CodexAuth::is_chatgpt_auth) {
+    if config.apps_enabled && auth.is_some_and(CodexAuth::uses_codex_backend) {
         servers.insert(
             CODEX_APPS_MCP_SERVER_NAME.to_string(),
-            codex_apps_mcp_server_config(config, auth),
+            codex_apps_mcp_server_config(config),
         );
     } else {
         servers.remove(CODEX_APPS_MCP_SERVER_NAME);
@@ -314,18 +289,73 @@ pub fn tool_plugin_provenance(config: &McpConfig) -> ToolPluginProvenance {
     ToolPluginProvenance::from_capability_summaries(&config.plugin_capability_summaries)
 }
 
+pub async fn read_mcp_resource(
+    config: &McpConfig,
+    auth: Option<&CodexAuth>,
+    runtime_environment: McpRuntimeEnvironment,
+    server: &str,
+    uri: &str,
+) -> anyhow::Result<ReadResourceResult> {
+    let mut mcp_servers = effective_mcp_servers(config, auth);
+    mcp_servers.retain(|name, _| name == server);
+    let auth_statuses = compute_auth_statuses(
+        mcp_servers.iter(),
+        config.mcp_oauth_credentials_store_mode,
+        auth,
+    )
+    .await;
+    let (tx_event, rx_event) = unbounded();
+    drop(rx_event);
+    let (manager, cancel_token) = McpConnectionManager::new(
+        &mcp_servers,
+        config.mcp_oauth_credentials_store_mode,
+        auth_statuses,
+        &config.approval_policy,
+        String::new(),
+        tx_event,
+        SandboxPolicy::new_read_only_policy(),
+        runtime_environment,
+        config.codex_home.clone(),
+        codex_apps_tools_cache_key(auth),
+        tool_plugin_provenance(config),
+        auth,
+    )
+    .await;
+
+    let result = manager
+        .read_resource(
+            server,
+            ReadResourceRequestParams {
+                meta: None,
+                uri: uri.to_string(),
+            },
+        )
+        .await;
+    cancel_token.cancel();
+    result
+}
+
 pub async fn collect_mcp_snapshot(
     config: &McpConfig,
     auth: Option<&CodexAuth>,
     submit_id: String,
+    runtime_environment: McpRuntimeEnvironment,
 ) -> McpListToolsResponseEvent {
-    collect_mcp_snapshot_with_detail(config, auth, submit_id, McpSnapshotDetail::Full).await
+    collect_mcp_snapshot_with_detail(
+        config,
+        auth,
+        submit_id,
+        runtime_environment,
+        McpSnapshotDetail::Full,
+    )
+    .await
 }
 
 pub async fn collect_mcp_snapshot_with_detail(
     config: &McpConfig,
     auth: Option<&CodexAuth>,
     submit_id: String,
+    runtime_environment: McpRuntimeEnvironment,
     detail: McpSnapshotDetail,
 ) -> McpListToolsResponseEvent {
     let mcp_servers = effective_mcp_servers(config, auth);
@@ -339,19 +369,15 @@ pub async fn collect_mcp_snapshot_with_detail(
         };
     }
 
-    let auth_status_entries =
-        compute_auth_statuses(mcp_servers.iter(), config.mcp_oauth_credentials_store_mode).await;
+    let auth_status_entries = compute_auth_statuses(
+        mcp_servers.iter(),
+        config.mcp_oauth_credentials_store_mode,
+        auth,
+    )
+    .await;
 
     let (tx_event, rx_event) = unbounded();
     drop(rx_event);
-
-    // Use ReadOnly sandbox policy for MCP snapshot collection (safest default)
-    let sandbox_state = SandboxState {
-        sandbox_policy: SandboxPolicy::new_read_only_policy(),
-        codex_linux_sandbox_exe: config.codex_linux_sandbox_exe.clone(),
-        sandbox_cwd: env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
-        use_legacy_landlock: config.use_legacy_landlock,
-    };
 
     let (mcp_connection_manager, cancel_token) = McpConnectionManager::new(
         &mcp_servers,
@@ -360,14 +386,96 @@ pub async fn collect_mcp_snapshot_with_detail(
         &config.approval_policy,
         submit_id,
         tx_event,
-        sandbox_state,
+        SandboxPolicy::new_read_only_policy(),
+        runtime_environment,
         config.codex_home.clone(),
         codex_apps_tools_cache_key(auth),
         tool_plugin_provenance,
+        auth,
     )
     .await;
 
     let snapshot = collect_mcp_snapshot_from_manager_with_detail(
+        &mcp_connection_manager,
+        auth_status_entries,
+        detail,
+    )
+    .await;
+
+    cancel_token.cancel();
+
+    snapshot
+}
+
+#[derive(Debug, Clone)]
+pub struct McpServerStatusSnapshot {
+    pub tools_by_server: HashMap<String, HashMap<String, Tool>>,
+    pub resources: HashMap<String, Vec<Resource>>,
+    pub resource_templates: HashMap<String, Vec<ResourceTemplate>>,
+    pub auth_statuses: HashMap<String, McpAuthStatus>,
+}
+
+pub async fn collect_mcp_server_status_snapshot(
+    config: &McpConfig,
+    auth: Option<&CodexAuth>,
+    submit_id: String,
+    runtime_environment: McpRuntimeEnvironment,
+) -> McpServerStatusSnapshot {
+    collect_mcp_server_status_snapshot_with_detail(
+        config,
+        auth,
+        submit_id,
+        runtime_environment,
+        McpSnapshotDetail::Full,
+    )
+    .await
+}
+
+pub async fn collect_mcp_server_status_snapshot_with_detail(
+    config: &McpConfig,
+    auth: Option<&CodexAuth>,
+    submit_id: String,
+    runtime_environment: McpRuntimeEnvironment,
+    detail: McpSnapshotDetail,
+) -> McpServerStatusSnapshot {
+    let mcp_servers = effective_mcp_servers(config, auth);
+    let tool_plugin_provenance = tool_plugin_provenance(config);
+    if mcp_servers.is_empty() {
+        return McpServerStatusSnapshot {
+            tools_by_server: HashMap::new(),
+            resources: HashMap::new(),
+            resource_templates: HashMap::new(),
+            auth_statuses: HashMap::new(),
+        };
+    }
+
+    let auth_status_entries = compute_auth_statuses(
+        mcp_servers.iter(),
+        config.mcp_oauth_credentials_store_mode,
+        auth,
+    )
+    .await;
+
+    let (tx_event, rx_event) = unbounded();
+    drop(rx_event);
+
+    let (mcp_connection_manager, cancel_token) = McpConnectionManager::new(
+        &mcp_servers,
+        config.mcp_oauth_credentials_store_mode,
+        auth_status_entries.clone(),
+        &config.approval_policy,
+        submit_id,
+        tx_event,
+        SandboxPolicy::new_read_only_policy(),
+        runtime_environment,
+        config.codex_home.clone(),
+        codex_apps_tools_cache_key(auth),
+        tool_plugin_provenance,
+        auth,
+    )
+    .await;
+
+    let snapshot = collect_mcp_server_status_snapshot_from_manager(
         &mcp_connection_manager,
         auth_status_entries,
         detail,
@@ -408,6 +516,154 @@ pub fn group_tools_by_server(
     grouped
 }
 
+fn protocol_tool_from_rmcp_tool(name: &str, tool: &rmcp::model::Tool) -> Option<Tool> {
+    match serde_json::to_value(tool) {
+        Ok(value) => match Tool::from_mcp_value(value) {
+            Ok(tool) => Some(tool),
+            Err(err) => {
+                tracing::warn!("Failed to convert MCP tool '{name}': {err}");
+                None
+            }
+        },
+        Err(err) => {
+            tracing::warn!("Failed to serialize MCP tool '{name}': {err}");
+            None
+        }
+    }
+}
+
+fn auth_statuses_from_entries(
+    auth_status_entries: &HashMap<String, crate::mcp::auth::McpAuthStatusEntry>,
+) -> HashMap<String, McpAuthStatus> {
+    auth_status_entries
+        .iter()
+        .map(|(name, entry)| (name.clone(), entry.auth_status))
+        .collect::<HashMap<_, _>>()
+}
+
+fn convert_mcp_resources(
+    resources: HashMap<String, Vec<rmcp::model::Resource>>,
+) -> HashMap<String, Vec<Resource>> {
+    resources
+        .into_iter()
+        .map(|(name, resources)| {
+            let resources = resources
+                .into_iter()
+                .filter_map(|resource| match serde_json::to_value(resource) {
+                    Ok(value) => match Resource::from_mcp_value(value.clone()) {
+                        Ok(resource) => Some(resource),
+                        Err(err) => {
+                            let (uri, resource_name) = match value {
+                                Value::Object(obj) => (
+                                    obj.get("uri")
+                                        .and_then(|v| v.as_str().map(ToString::to_string)),
+                                    obj.get("name")
+                                        .and_then(|v| v.as_str().map(ToString::to_string)),
+                                ),
+                                _ => (None, None),
+                            };
+
+                            tracing::warn!(
+                                "Failed to convert MCP resource (uri={uri:?}, name={resource_name:?}): {err}"
+                            );
+                            None
+                        }
+                    },
+                    Err(err) => {
+                        tracing::warn!("Failed to serialize MCP resource: {err}");
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            (name, resources)
+        })
+        .collect::<HashMap<_, _>>()
+}
+
+fn convert_mcp_resource_templates(
+    resource_templates: HashMap<String, Vec<rmcp::model::ResourceTemplate>>,
+) -> HashMap<String, Vec<ResourceTemplate>> {
+    resource_templates
+        .into_iter()
+        .map(|(name, templates)| {
+            let templates = templates
+                .into_iter()
+                .filter_map(|template| match serde_json::to_value(template) {
+                    Ok(value) => match ResourceTemplate::from_mcp_value(value.clone()) {
+                        Ok(template) => Some(template),
+                        Err(err) => {
+                            let (uri_template, template_name) = match value {
+                                Value::Object(obj) => (
+                                    obj.get("uriTemplate")
+                                        .or_else(|| obj.get("uri_template"))
+                                        .and_then(|v| v.as_str().map(ToString::to_string)),
+                                    obj.get("name")
+                                        .and_then(|v| v.as_str().map(ToString::to_string)),
+                                ),
+                                _ => (None, None),
+                            };
+
+                            tracing::warn!(
+                                "Failed to convert MCP resource template (uri_template={uri_template:?}, name={template_name:?}): {err}"
+                            );
+                            None
+                        }
+                    },
+                    Err(err) => {
+                        tracing::warn!("Failed to serialize MCP resource template: {err}");
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            (name, templates)
+        })
+        .collect::<HashMap<_, _>>()
+}
+
+async fn collect_mcp_server_status_snapshot_from_manager(
+    mcp_connection_manager: &McpConnectionManager,
+    auth_status_entries: HashMap<String, crate::mcp::auth::McpAuthStatusEntry>,
+    detail: McpSnapshotDetail,
+) -> McpServerStatusSnapshot {
+    let (tools, resources, resource_templates) = tokio::join!(
+        mcp_connection_manager.list_all_tools(),
+        async {
+            if detail.include_resources() {
+                mcp_connection_manager.list_all_resources().await
+            } else {
+                HashMap::new()
+            }
+        },
+        async {
+            if detail.include_resources() {
+                mcp_connection_manager.list_all_resource_templates().await
+            } else {
+                HashMap::new()
+            }
+        },
+    );
+
+    let mut tools_by_server = HashMap::<String, HashMap<String, Tool>>::new();
+    for (_qualified_name, tool_info) in tools {
+        let raw_tool_name = tool_info.tool.name.to_string();
+        let Some(tool) = protocol_tool_from_rmcp_tool(&raw_tool_name, &tool_info.tool) else {
+            continue;
+        };
+        let tool_name = tool.name.clone();
+        tools_by_server
+            .entry(tool_info.server_name)
+            .or_default()
+            .insert(tool_name, tool);
+    }
+
+    McpServerStatusSnapshot {
+        tools_by_server,
+        resources: convert_mcp_resources(resources),
+        resource_templates: convert_mcp_resource_templates(resource_templates),
+        auth_statuses: auth_statuses_from_entries(&auth_status_entries),
+    }
+}
+
 pub async fn collect_mcp_snapshot_from_manager(
     mcp_connection_manager: &McpConnectionManager,
     auth_status_entries: HashMap<String, McpAuthStatusEntry>,
@@ -443,104 +699,18 @@ pub async fn collect_mcp_snapshot_from_manager_with_detail(
         },
     );
 
-    let auth_statuses = auth_status_entries
-        .iter()
-        .map(|(name, entry)| (name.clone(), entry.auth_status))
-        .collect::<HashMap<_, _>>();
-
     let tools = tools
         .into_iter()
-        .filter_map(|(name, tool)| match serde_json::to_value(tool.tool) {
-            Ok(value) => match Tool::from_mcp_value(value) {
-                Ok(tool) => Some((name, tool)),
-                Err(err) => {
-                    tracing::warn!("Failed to convert MCP tool '{name}': {err}");
-                    None
-                }
-            },
-            Err(err) => {
-                tracing::warn!("Failed to serialize MCP tool '{name}': {err}");
-                None
-            }
-        })
-        .collect::<HashMap<_, _>>();
-
-    let resources = resources
-        .into_iter()
-        .map(|(name, resources)| {
-            let resources = resources
-                .into_iter()
-                .filter_map(|resource| match serde_json::to_value(resource) {
-                    Ok(value) => match Resource::from_mcp_value(value.clone()) {
-                        Ok(resource) => Some(resource),
-                        Err(err) => {
-                            let (uri, resource_name) = match value {
-                                Value::Object(obj) => (
-                                    obj.get("uri")
-                                        .and_then(|v| v.as_str().map(ToString::to_string)),
-                                    obj.get("name")
-                                        .and_then(|v| v.as_str().map(ToString::to_string)),
-                                ),
-                                _ => (None, None),
-                            };
-
-                            tracing::warn!(
-                                "Failed to convert MCP resource (uri={uri:?}, name={resource_name:?}): {err}"
-                            );
-                            None
-                        }
-                    },
-                    Err(err) => {
-                        tracing::warn!("Failed to serialize MCP resource: {err}");
-                        None
-                    }
-                })
-                .collect::<Vec<_>>();
-            (name, resources)
-        })
-        .collect::<HashMap<_, _>>();
-
-    let resource_templates = resource_templates
-        .into_iter()
-        .map(|(name, templates)| {
-            let templates = templates
-                .into_iter()
-                .filter_map(|template| match serde_json::to_value(template) {
-                    Ok(value) => match ResourceTemplate::from_mcp_value(value.clone()) {
-                        Ok(template) => Some(template),
-                        Err(err) => {
-                            let (uri_template, template_name) = match value {
-                                Value::Object(obj) => (
-                                    obj.get("uriTemplate")
-                                        .or_else(|| obj.get("uri_template"))
-                                        .and_then(|v| v.as_str().map(ToString::to_string)),
-                                    obj.get("name")
-                                        .and_then(|v| v.as_str().map(ToString::to_string)),
-                                ),
-                                _ => (None, None),
-                            };
-
-                            tracing::warn!(
-                                "Failed to convert MCP resource template (uri_template={uri_template:?}, name={template_name:?}): {err}"
-                            );
-                            None
-                        }
-                    },
-                    Err(err) => {
-                        tracing::warn!("Failed to serialize MCP resource template: {err}");
-                        None
-                    }
-                })
-                .collect::<Vec<_>>();
-            (name, templates)
+        .filter_map(|(name, tool)| {
+            protocol_tool_from_rmcp_tool(&name, &tool.tool).map(|tool| (name, tool))
         })
         .collect::<HashMap<_, _>>();
 
     McpListToolsResponseEvent {
         tools,
-        resources,
-        resource_templates,
-        auth_statuses,
+        resources: convert_mcp_resources(resources),
+        resource_templates: convert_mcp_resource_templates(resource_templates),
+        auth_statuses: auth_statuses_from_entries(&auth_status_entries),
     }
 }
 
