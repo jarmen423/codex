@@ -1,3 +1,24 @@
+use super::replace_path_and_deduplicate;
+use pretty_assertions::assert_eq;
+use std::path::Path;
+
+#[test]
+fn replace_path_and_deduplicate_preserves_other_paths_and_order() {
+    let old_path = Path::new("old");
+    let new_path = Path::new("new");
+    let extra = Path::new("extra");
+    let descendant = Path::new("old/child");
+
+    assert_eq!(
+        replace_path_and_deduplicate(
+            vec![old_path, extra, descendant, new_path, extra],
+            old_path,
+            new_path,
+        ),
+        vec![new_path, extra, descendant]
+    );
+}
+
 #[cfg(unix)]
 mod symlinks {
     use super::super::resolve_symlink_write_paths;
@@ -76,5 +97,40 @@ mod native_workdir {
             normalize_for_native_workdir_with_flag(path.clone(), /*is_windows*/ false);
 
         assert_eq!(normalized, path);
+    }
+}
+
+mod path_comparison {
+    use super::super::paths_match_after_normalization;
+    use std::path::PathBuf;
+
+    #[test]
+    fn matches_identical_existing_paths() -> std::io::Result<()> {
+        let dir = tempfile::tempdir()?;
+
+        assert!(paths_match_after_normalization(dir.path(), dir.path()));
+        Ok(())
+    }
+
+    #[test]
+    fn falls_back_to_raw_equality_when_paths_cannot_be_normalized() {
+        assert!(paths_match_after_normalization(
+            PathBuf::from("missing"),
+            PathBuf::from("missing"),
+        ));
+        assert!(!paths_match_after_normalization(
+            PathBuf::from("missing-a"),
+            PathBuf::from("missing-b"),
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn matches_windows_verbatim_paths() -> std::io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let verbatim_dir = PathBuf::from(format!(r"\\?\{}", dir.path().display()));
+
+        assert!(paths_match_after_normalization(verbatim_dir, dir.path()));
+        Ok(())
     }
 }

@@ -38,6 +38,8 @@ pub struct IdTokenInfo {
     pub chatgpt_user_id: Option<String>,
     /// Organization/workspace identifier associated with the token, if present.
     pub chatgpt_account_id: Option<String>,
+    /// Whether the selected ChatGPT workspace must route through the FedRAMP edge.
+    pub chatgpt_account_is_fedramp: bool,
     pub raw_jwt: String,
 }
 
@@ -65,6 +67,10 @@ impl IdTokenInfo {
             self.chatgpt_plan_type,
             Some(PlanType::Known(plan)) if plan.is_workspace_account()
         )
+    }
+
+    pub fn is_fedramp_account(&self) -> bool {
+        self.chatgpt_account_is_fedramp
     }
 }
 
@@ -94,12 +100,26 @@ struct AuthClaims {
     user_id: Option<String>,
     #[serde(default)]
     chatgpt_account_id: Option<String>,
+    #[serde(default)]
+    chatgpt_account_is_fedramp: bool,
 }
 
 #[derive(Deserialize)]
 struct StandardJwtClaims {
     #[serde(default)]
     exp: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct AccountUserClaims {
+    #[serde(rename = "https://api.openai.com/auth")]
+    auth: Option<AccountUserAuthClaims>,
+}
+
+#[derive(Deserialize)]
+struct AccountUserAuthClaims {
+    chatgpt_account_user_id: Option<String>,
+    chatgpt_account_id: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -132,6 +152,31 @@ pub fn parse_jwt_expiration(jwt: &str) -> Result<Option<DateTime<Utc>>, IdTokenI
         .and_then(|exp| DateTime::<Utc>::from_timestamp(exp, 0)))
 }
 
+// Keep membership parsing separate from ordinary auth claims: a malformed optional
+// membership must disable local verification without breaking an otherwise valid login.
+// Both paths share decode_jwt_payload for the JWT envelope.
+pub(crate) fn parse_chatgpt_account_user_id(
+    jwt: &str,
+    account_id: &str,
+) -> Result<Option<String>, IdTokenInfoError> {
+    if account_id.is_empty() || account_id.trim() != account_id {
+        return Ok(None);
+    }
+    if jwt.split('.').count() != 3 {
+        return Err(IdTokenInfoError::InvalidFormat);
+    }
+    let claims: AccountUserClaims = decode_jwt_payload(jwt)?;
+    let Some(auth) = claims.auth else {
+        return Ok(None);
+    };
+    if auth.chatgpt_account_id.as_deref() != Some(account_id) {
+        return Ok(None);
+    }
+    Ok(auth
+        .chatgpt_account_user_id
+        .filter(|id| !id.is_empty() && id.trim() == id.as_str()))
+}
+
 pub fn parse_chatgpt_jwt_claims(jwt: &str) -> Result<IdTokenInfo, IdTokenInfoError> {
     let claims: IdClaims = decode_jwt_payload(jwt)?;
     let email = claims
@@ -145,6 +190,7 @@ pub fn parse_chatgpt_jwt_claims(jwt: &str) -> Result<IdTokenInfo, IdTokenInfoErr
             chatgpt_plan_type: auth.chatgpt_plan_type,
             chatgpt_user_id: auth.chatgpt_user_id.or(auth.user_id),
             chatgpt_account_id: auth.chatgpt_account_id,
+            chatgpt_account_is_fedramp: auth.chatgpt_account_is_fedramp,
         }),
         None => Ok(IdTokenInfo {
             email,
@@ -152,6 +198,7 @@ pub fn parse_chatgpt_jwt_claims(jwt: &str) -> Result<IdTokenInfo, IdTokenInfoErr
             chatgpt_plan_type: None,
             chatgpt_user_id: None,
             chatgpt_account_id: None,
+            chatgpt_account_is_fedramp: false,
         }),
     }
 }

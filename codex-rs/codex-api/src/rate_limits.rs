@@ -1,5 +1,6 @@
 use codex_protocol::account::PlanType;
 use codex_protocol::protocol::CreditsSnapshot;
+use codex_protocol::protocol::RateLimitReachedType;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::RateLimitWindow;
 use http::HeaderMap;
@@ -89,10 +90,14 @@ pub fn parse_rate_limit_for_limit(
     Some(RateLimitSnapshot {
         limit_id: Some(normalized_limit_id),
         limit_name: parsed_limit_name,
+        normal_model_slug: None,
         primary,
         secondary,
         credits,
+        individual_limit: None,
+        spend_control_reached: None,
         plan_type: None,
+        rate_limit_reached_type: None,
     })
 }
 
@@ -152,10 +157,14 @@ pub fn parse_rate_limit_event(payload: &str) -> Option<RateLimitSnapshot> {
     Some(RateLimitSnapshot {
         limit_id: Some(limit_id.unwrap_or_else(|| "codex".to_string())),
         limit_name: None,
+        normal_model_slug: None,
         primary,
         secondary,
         credits,
+        individual_limit: None,
+        spend_control_reached: None,
         plan_type: event.plan_type,
+        rate_limit_reached_type: None,
     })
 }
 
@@ -174,6 +183,13 @@ pub fn parse_promo_message(headers: &HeaderMap) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(std::string::ToString::to_string)
+}
+
+pub(crate) fn parse_rate_limit_reached_type(headers: &HeaderMap) -> Option<RateLimitReachedType> {
+    parse_header_str(headers, "x-codex-rate-limit-reached-type")?
+        .trim()
+        .parse()
+        .ok()
 }
 
 fn parse_rate_limit_window(
