@@ -130,19 +130,24 @@ mod clipboard_paste;
 mod clock_format;
 mod collaboration_modes;
 mod color;
+mod command_output;
 mod config_panel;
 mod config_update;
 mod copy_input_guard;
 pub(crate) mod custom_terminal;
 mod daybreak;
+mod device_login;
 mod experimental_features;
+mod image_decode;
 mod markdown_copy;
 mod permission_discovery;
 mod pets;
+mod realtime_call;
 mod security_setup;
 mod worktree_browser;
 pub use custom_terminal::Terminal;
 mod assistant_directives;
+mod attachment_files;
 mod auto_review_denials;
 mod cwd_prompt;
 mod debug_config;
@@ -225,6 +230,7 @@ mod startup_presentation;
 mod startup_recovery;
 mod status;
 mod status_indicator_widget;
+mod statusline_provider;
 mod streaming;
 mod style;
 mod subscription;
@@ -938,7 +944,9 @@ fn latest_session_lookup_params(
     lookup_mode: LatestSessionLookupMode,
 ) -> ThreadListParams {
     ThreadListParams {
+        include_attached_threads: false,
         current_account_only: true,
+        included_thread_ids: None,
         excluded_thread_ids: None,
         attached_to_thread_id: None,
         originators: None,
@@ -1209,6 +1217,7 @@ pub async fn run_main(
                 token_usage: TokenUsage::default(),
                 thread_id: None,
                 resume_hint: None,
+                archive_warnings: Vec::new(),
                 disconnect_info: None,
                 update_action: None,
                 exit_reason: ExitReason::UserRequested,
@@ -1298,6 +1307,7 @@ async fn run_ratatui_app(
                         token_usage: crate::token_usage::TokenUsage::default(),
                         thread_id: None,
                         resume_hint: None,
+                        archive_warnings: Vec::new(),
                         disconnect_info: None,
                         update_action: Some(action),
                         exit_reason: ExitReason::UserRequested,
@@ -1486,6 +1496,7 @@ async fn run_ratatui_app(
                 token_usage: crate::token_usage::TokenUsage::default(),
                 thread_id: None,
                 resume_hint: None,
+                archive_warnings: Vec::new(),
                 disconnect_info: None,
                 update_action: None,
                 exit_reason: ExitReason::UserRequested,
@@ -1619,6 +1630,7 @@ async fn run_ratatui_app(
                 token_usage: crate::token_usage::TokenUsage::default(),
                 thread_id: None,
                 resume_hint: None,
+                archive_warnings: Vec::new(),
                 disconnect_info: None,
                 update_action: None,
                 exit_reason: ExitReason::Fatal(format!(
@@ -1736,6 +1748,7 @@ async fn run_ratatui_app(
                         token_usage: crate::token_usage::TokenUsage::default(),
                         thread_id: None,
                         resume_hint: None,
+                        archive_warnings: Vec::new(),
                         disconnect_info: None,
                         update_action: None,
                         exit_reason: ExitReason::UserRequested,
@@ -1840,6 +1853,7 @@ async fn run_ratatui_app(
                     token_usage: crate::token_usage::TokenUsage::default(),
                     thread_id: None,
                     resume_hint: None,
+                    archive_warnings: Vec::new(),
                     disconnect_info: None,
                     update_action: None,
                     exit_reason: ExitReason::UserRequested,
@@ -1891,6 +1905,7 @@ async fn run_ratatui_app(
                 token_usage: crate::token_usage::TokenUsage::default(),
                 thread_id: None,
                 resume_hint: None,
+                archive_warnings: Vec::new(),
                 disconnect_info: None,
                 update_action: None,
                 exit_reason: ExitReason::UserRequested,
@@ -2219,6 +2234,35 @@ async fn run_ratatui_app(
         && (config.model_provider.is_amazon_bedrock()
             || !matches!(app_server_target, AppServerTarget::Embedded));
     let guidance_request_handle = app_server.request_handle();
+    let gateway_sign_in = async {
+        if !uses_remote_workspace
+            && let Some(prompt) = startup_draft
+                .run_until(
+                    &mut tui,
+                    device_login::start_if_needed(
+                        &mut app_server,
+                        &session_selection,
+                        &config,
+                        device_login::prefer_device_login(),
+                    ),
+                )
+                .await??
+        {
+            startup_draft.flush_pending_events(&mut tui).await?;
+            onboarding::onboarding_screen::run_gateway_device_login(
+                &mut tui,
+                &mut app_server,
+                prompt,
+            )
+            .await?;
+        }
+        Ok::<_, color_eyre::Report>(())
+    }
+    .await;
+    if let Err(err) = gateway_sign_in {
+        shutdown_startup_session(Some(app_server), &mut terminal_restore_guard).await;
+        return Err(err);
+    }
     let startup_prefetch_started_at = Instant::now();
     // Fetch the catalog alongside hooks/list. Fresh starts choose the model after config/read.
     app_server.prefetch_model_list();
