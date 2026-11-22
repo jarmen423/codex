@@ -39,6 +39,8 @@ use codex_app_server_client::RemoteAppServerClient;
 use codex_app_server_client::RemoteAppServerConnectArgs;
 pub use codex_app_server_client::RemoteAppServerEndpoint;
 use codex_app_server_client::cloud_backend;
+pub use codex_app_server_client::resolve_remote_addr;
+pub use codex_app_server_client::resolve_remote_endpoint;
 use codex_app_server_protocol::Account as AppServerAccount;
 use codex_app_server_protocol::AskForApproval;
 use codex_app_server_protocol::ConfigWarningNotification;
@@ -97,7 +99,6 @@ use tracing::warn;
 use tracing_appender::non_blocking;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
-use url::Url;
 use uuid::Uuid;
 
 pub(crate) use codex_app_server_client::legacy_core;
@@ -218,9 +219,11 @@ mod session_start;
 mod session_state;
 mod shortcut_help;
 mod sidebar_chooser;
+mod sidebar_image;
 mod sidebar_tab_strip;
 mod skills_helpers;
 mod slash_command;
+mod slash_command_settings;
 mod startup_draft;
 mod startup_error;
 mod startup_hooks_review;
@@ -230,6 +233,7 @@ mod startup_presentation;
 mod startup_recovery;
 mod status;
 mod status_indicator_widget;
+mod statusline_metrics;
 mod statusline_provider;
 mod streaming;
 mod style;
@@ -237,6 +241,7 @@ mod subscription;
 mod system_motion;
 mod task_mentions;
 mod temporary_structured_request;
+mod terminal_capabilities;
 mod terminal_hyperlinks;
 mod terminal_palette;
 mod terminal_probe;
@@ -247,6 +252,8 @@ mod text_formatting;
 mod text_selection;
 mod theme_picker;
 mod thread_color;
+mod thread_label;
+mod thread_links;
 mod thread_transcript;
 mod token_usage;
 mod tool_output;
@@ -439,93 +446,6 @@ fn remove_legacy_tui_log_file(codex_home: &Path) {
     // Shared append-only TUI logs could grow without bound. Existing processes
     // may still hold the file open, so startup cleanup is best effort.
     let _ = std::fs::remove_file(codex_home.join("log").join(TUI_LOG_FILE_NAME));
-}
-
-fn remote_addr_has_explicit_port(addr: &str, parsed: &Url) -> bool {
-    let Some(host) = parsed.host_str() else {
-        return false;
-    };
-    if parsed.port().is_some() {
-        return true;
-    }
-
-    let Some((_, rest)) = addr.split_once("://") else {
-        return false;
-    };
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let authority = &rest[..authority_end];
-    let host_and_port = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host_and_port)| host_and_port);
-    let explicit_default_port = match parsed.scheme() {
-        "ws" => 80,
-        "wss" => 443,
-        _ => return false,
-    };
-    let expected_host = if host.contains(':') {
-        format!("[{host}]")
-    } else {
-        host.to_string()
-    };
-    host_and_port == format!("{expected_host}:{explicit_default_port}")
-}
-
-fn websocket_url_supports_auth_token(parsed: &Url) -> bool {
-    match (parsed.scheme(), parsed.host()) {
-        ("wss", Some(_)) => true,
-        ("ws", Some(url::Host::Domain(domain))) => domain.eq_ignore_ascii_case("localhost"),
-        ("ws", Some(url::Host::Ipv4(addr))) => addr.is_loopback(),
-        ("ws", Some(url::Host::Ipv6(addr))) => addr.is_loopback(),
-        _ => false,
-    }
-}
-
-pub fn resolve_remote_addr(addr: &str) -> color_eyre::Result<RemoteAppServerEndpoint> {
-    if let Some(socket_path) = addr.strip_prefix("unix://") {
-        let socket_path = if socket_path.is_empty() {
-            let codex_home = find_codex_home().wrap_err("failed to resolve CODEX_HOME")?;
-            codex_app_server_client::app_server_control_socket_path(&codex_home)
-                .map_err(color_eyre::Report::new)?
-        } else {
-            AbsolutePathBuf::relative_to_current_dir(socket_path)
-                .map_err(color_eyre::Report::new)?
-        };
-        return Ok(RemoteAppServerEndpoint::UnixSocket { socket_path });
-    }
-
-    let parsed = match Url::parse(addr) {
-        Ok(parsed) => parsed,
-        Err(_) => {
-            color_eyre::eyre::bail!(
-                "invalid remote address `{addr}`; expected `ws://host:port`, `wss://host:port`, `unix://`, or `unix://PATH`"
-            );
-        }
-    };
-    if matches!(parsed.scheme(), "ws" | "wss")
-        && parsed.host_str().is_some()
-        && remote_addr_has_explicit_port(addr, &parsed)
-        && parsed.path() == "/"
-        && parsed.query().is_none()
-        && parsed.fragment().is_none()
-    {
-        return Ok(RemoteAppServerEndpoint::WebSocket {
-            websocket_url: parsed.to_string(),
-            auth_token: None,
-        });
-    }
-
-    color_eyre::eyre::bail!(
-        "invalid remote address `{addr}`; expected `ws://host:port`, `wss://host:port`, `unix://`, or `unix://PATH`"
-    );
-}
-
-pub fn remote_addr_supports_auth_token(endpoint: &RemoteAppServerEndpoint) -> bool {
-    match endpoint {
-        RemoteAppServerEndpoint::WebSocket { websocket_url, .. } => {
-            Url::parse(websocket_url).is_ok_and(|parsed| websocket_url_supports_auth_token(&parsed))
-        }
-        RemoteAppServerEndpoint::UnixSocket { .. } => false,
-    }
 }
 
 async fn connect_remote_app_server(
@@ -1245,6 +1165,7 @@ async fn run_ratatui_app(
     mut app_server_target: AppServerTarget,
     remote_cwd_override: Option<PathBuf>,
     initial_config: Config,
+    statusline_metrics: statusline_metrics::StatuslineMetrics,
     manually_selected_oss_provider: Option<String>,
     overrides: ConfigOverrides,
     cli_kv_overrides: Vec<(String, toml::Value)>,
@@ -1340,6 +1261,17 @@ async fn run_ratatui_app(
         )
         .await
     };
+    if cli.resume_picker {
+        tui.draw(/*height*/ 1, |frame| {
+            frame.render_widget_ref(&resume_picker::loading_sessions_line(), frame.area());
+        })?;
+    }
+    let clear_inline_loading = |tui: &mut Tui| {
+        if cli.resume_picker && !tui.is_alt_screen_active() {
+            // Draw so the viewport follows the shell cursor after suspend/resume.
+            let _ = tui.draw(/*height*/ 0, |_| {});
+        }
+    };
     let startup_app_server = startup_draft
         .run_until(
             &mut tui,
@@ -1367,11 +1299,13 @@ async fn run_ratatui_app(
             .with_local_codex_home(&initial_config.codex_home)
         }
         Ok(Err(err)) => {
+            clear_inline_loading(&mut tui);
             terminal_restore_guard.restore_silently();
             session_log::log_session_end();
             return Err(err);
         }
         Err(err) => {
+            clear_inline_loading(&mut tui);
             terminal_restore_guard.restore_silently();
             session_log::log_session_end();
             return Err(err.into());
@@ -1398,6 +1332,7 @@ async fn run_ratatui_app(
                 );
             }
             Err(err) => {
+                clear_inline_loading(&mut tui);
                 shutdown_startup_session(Some(app_server_session), &mut terminal_restore_guard)
                     .await;
                 return Err(err.into());
@@ -1417,6 +1352,7 @@ async fn run_ratatui_app(
     let login_status = startup_draft
         .run_until(&mut tui, get_login_status(active_app_server))
         .await;
+    clear_inline_loading(&mut tui);
     let (login_status, mut startup_account) = match login_status {
         Ok(Ok((login_status, account))) => (login_status, Some(account)),
         Ok(Err(err)) => {
@@ -2190,6 +2126,10 @@ async fn run_ratatui_app(
 
     let local_settings = crate::local_settings::LocalSettings::for_tui(&config, &tui);
     crate::markdown_render::preferences::init(local_settings.tui.rendering);
+    crate::markdown_render::preferences::set_document_links(
+        local_settings.workspace_enabled(&config)
+            && app_server_target.thread_params_mode() != ThreadParamsMode::Cloud,
+    );
     // Configure syntax highlighting theme from the final config — onboarding
     // and resume/fork can both reload config with a different tui_theme, so
     // this must happen after the last possible reload.
@@ -2375,6 +2315,7 @@ async fn run_ratatui_app(
         &mut tui,
         initial_backends,
         config,
+        statusline_metrics,
         current_cwd.to_path_buf(),
         backend_preference_context,
         cli_kv_overrides.clone(),
